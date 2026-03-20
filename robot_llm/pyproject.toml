@@ -1,0 +1,32 @@
+[project]
+name = "franka-robot-controller"
+version = "0.1.0"
+description = "Moduli Python per il controllo di robot Franka Robotics tramite pylibfranka"
+authors = [{ name = "Andrea Lombardo", email = "l.andrea195@live.it" }]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["numpy>=1.20.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "black>=23.0.0", "ruff>=0.1.0"]
+
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

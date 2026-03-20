@@ -1,0 +1,17 @@
+LICENSE
+README.md
+pyproject.toml
+setup.cfg
+src/franka_controller/__init__.py
+src/franka_controller/gripper.py
+src/franka_controller/gripper_old.py
+src/franka_controller/motion.py
+src/franka_controller/robot.py
+src/franka_controller/utils.py
+src/franka_robot_controller.egg-info/PKG-INFO
+src/franka_robot_controller.egg-info/SOURCES.txt
+src/franka_robot_controller.egg-info/dependency_links.txt
+src/franka_robot_controller.egg-info/requires.txt
+src/franka_robot_controller.egg-info/top_level.txt
+tests/test_integration.py
+tests/test_robot.py
