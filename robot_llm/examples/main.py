@@ -11,7 +11,14 @@ import sys
 import numpy as np
 from franka_controller import FrankaRobot
 
-
+pose1 = [0.1601747338677177, -0.13314153275982454, -0.23210223978843075, -2.282551255319605, 1.4401673292125021, 1.7223496288987419, 0.227743905258227]
+pose2 = [0.24331267448521512, -0.1008804753139512, -0.16947217878813267, -2.3149512770949685, 1.4401392707139342, 1.7219941665734733, 0.22701246033680494]
+pose3 = [0.24604548034651855, 0.10079375949413885, -0.16943161981786944, -2.527100991549152, 1.4400407739126129, 1.720661255079275, 0.27097378511370995]
+poses_default = {
+    "1": pose1,
+    "2": pose2,
+    "3": pose3
+}
 def print_menu():
     """Stampa il menu principale."""
     print("\n" + "=" * 60)
@@ -105,8 +112,22 @@ def move_joints_custom(robot: FrankaRobot):
     print("Esempio: 0 -0.785 0 -2.356 0 1.571 0.785")
 
     try:
-        user_input = input("Posizioni: ")
-        positions = [float(x) for x in user_input.split()]
+        if input("Usare pose predefinite? (y/n): ").lower() == "y":
+            print("\nPose predefinite:")
+            print("1. Pose 1")
+            print("2. Pose 2")
+            print("3. Pose 3")
+            pose_choice = input("Scegli una pose (1-3): ")
+            if pose_choice in poses_default:
+                positions = poses_default[pose_choice]
+            else:
+                print("✗ Scelta non valida, inserisci manualmente le posizioni.")
+                user_input = input("Posizioni: ")
+                positions = [float(x) for x in user_input.split()]
+
+        else:
+            user_input = input("Posizioni: ")
+            positions = [float(x) for x in user_input.split()]
 
         if len(positions) != 7:
             print("✗ Devi specificare esattamente 7 posizioni!")

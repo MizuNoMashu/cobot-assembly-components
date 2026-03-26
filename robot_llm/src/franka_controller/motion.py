@@ -8,7 +8,6 @@ import numpy as np
 from typing import List, Optional, Callable, Dict
 import pylibfranka
 
-
 class MotionController:
     """
     Controller per gestire il movimento del robot Franka con pylibfranka.
@@ -36,7 +35,7 @@ class MotionController:
         tolerance: float = 0.01,
     ) -> bool:
         """
-        Muove il robot verso una configurazione target dei giunti usando un motion generator.
+        Muove il robot verso una configurazione target dei giunti usando un controllo esterno.
 
         Args:
             target_positions: Lista di 7 posizioni target in radianti
@@ -53,32 +52,46 @@ class MotionController:
 
         print(f"Movimento verso posizioni target: {np.round(target, 3).tolist()}")
 
-        # Ottieni posizione iniziale
-        initial_state = self.robot.get_state()
-        q_start = np.array(initial_state.q)
-
-        # Parametri del motion generator
-        duration = 5.0 / speed_factor  # Durata del movimento in secondi
-        time_start = time.time()
-
-        def motion_generator_callback(robot_state: pylibfranka.RobotState, period: float) -> Dict:
-            """
-            Callback per generare posizioni target in real-time.
-            Ritorna un dizionario con le posizioni dei giunti e un flag finished.
-            """
-            elapsed = time.time() - time_start
-            progress = min(elapsed / duration, 1.0)
-
-            # Traiettoria minimum jerk dal punto iniziale al target
-            q_current = q_start + (target - q_start) * compute_minimum_jerk_trajectory(progress)
-
-            finished = progress >= 1.0
-
-            return {"q_goal": q_current.tolist(), "finished": finished}
-
         try:
             # Avvia il controllo in posizione dei giunti
-            self.robot.robot.start_joint_position_control(motion_generator_callback)
+            active_control = self.robot.robot.start_joint_position_control(
+                pylibfranka.ControllerMode.CartesianImpedance
+            )
+
+            # Ottieni posizione iniziale dal primo stato letto
+            initial_state = self.robot.get_state()
+            q_start = np.array(initial_state.q)
+
+            # Parametri del movimento
+            duration = 5.0 / speed_factor
+            time_elapsed = 0.0
+            motion_finished = False
+
+            # Loop di controllo esterno
+            while not motion_finished:
+                # Leggi stato del robot
+                robot_state, delta_time = active_control.readOnce()
+                
+                # Aggiorna tempo
+                time_elapsed += delta_time.to_sec()
+                progress = min(time_elapsed / duration, 1.0)
+
+                # Calcola posizione intermedia con traiettoria minimum jerk
+                q_current = q_start + (target - q_start) * compute_minimum_jerk_trajectory(progress)
+
+                # Crea comando di posizione
+                joint_cmd = pylibfranka.JointPositions(q_current.tolist())
+                
+                # Imposta flag di movimento finito
+                if progress >= 1.0:
+                    joint_cmd.motion_finished = True
+                    motion_finished = True
+                else:
+                    joint_cmd.motion_finished = False
+
+                # Invia comando al robot
+                active_control.writeOnce(joint_cmd)
+
             print("✓ Movimento completato")
             return True
 
@@ -219,7 +232,7 @@ class MotionController:
         Esegue controllo di velocità dei giunti usando un callback.
 
         Args:
-            velocity_callback: Funzione che riceve (RobotState, period: float) e
+            velocity_callback: Funzione che riceve (RobotState, delta_time: float) e
                              ritorna velocità desiderate [rad/s] per i 7 giunti
             duration: Durata del controllo in secondi
 
@@ -228,20 +241,38 @@ class MotionController:
         """
         print(f"Avvio controllo velocità per {duration}s")
 
-        time_start = time.time()
-
-        def velocity_generator(robot_state: pylibfranka.RobotState, period: float) -> Dict:
-            """Wrapper del callback dell'utente."""
-            elapsed = time.time() - time_start
-
-            if elapsed >= duration:
-                return {"dq_goal": [0.0] * 7, "finished": True}
-
-            dq = velocity_callback(robot_state, period)
-            return {"dq_goal": dq, "finished": False}
-
         try:
-            self.robot.robot.start_joint_velocity_control(velocity_generator)
+            # Avvia il controllo di velocità dei giunti
+            active_control = self.robot.robot.start_joint_velocity_control(
+                pylibfranka.ControllerMode.CartesianImpedance
+            )
+
+            time_elapsed = 0.0
+            motion_finished = False
+
+            while not motion_finished:
+                # Leggi stato del robot
+                robot_state, delta_time = active_control.readOnce()
+                
+                # Aggiorna tempo
+                time_elapsed += delta_time.to_sec()
+
+                # Chiama il callback dell'utente
+                dq = velocity_callback(robot_state, delta_time.to_sec())
+
+                # Crea comando di velocità
+                velocity_cmd = pylibfranka.JointVelocities(dq)
+                
+                # Verifica se abbiamo raggiunto il tempo massimo
+                if time_elapsed >= duration:
+                    velocity_cmd.motion_finished = True
+                    motion_finished = True
+                else:
+                    velocity_cmd.motion_finished = False
+
+                # Invia comando al robot
+                active_control.writeOnce(velocity_cmd)
+
             print("✓ Controllo velocità completato")
             return True
         except Exception as e:
