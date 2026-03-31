@@ -275,37 +275,6 @@ class MotionController:
         """
         print(f"Avvio controllo velocità per {duration}s")
 
-        try:
-            # Avvia il controllo di velocità dei giunti
-            active_control = self.robot.robot.start_joint_velocity_control(
-                pylibfranka.ControllerMode.CartesianImpedance
-            )
-
-            time_elapsed = 0.0
-            motion_finished = False
-
-            while not motion_finished:
-                # Leggi stato del robot
-                robot_state, delta_time = active_control.readOnce()
-                
-                # Aggiorna tempo
-                time_elapsed += delta_time.to_sec()
-
-                # Chiama il callback dell'utente
-                dq = velocity_callback(robot_state, delta_time.to_sec())
-
-                # Crea comando di velocità
-                velocity_cmd = pylibfranka.JointVelocities(dq)
-                
-                # Verifica se abbiamo raggiunto il tempo massimo
-                if time_elapsed >= duration:
-                    velocity_cmd.motion_finished = True
-                    motion_finished = True
-                else:
-                    velocity_cmd.motion_finished = False
-
-                # Invia comando al robot
-                active_control.writeOnce(velocity_cmd)
 
         try:
             # Avvia il controllo di velocità dei giunti
