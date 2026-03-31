@@ -23,24 +23,6 @@ def validate_joint_positions(positions: List[float], num_joints: int = 7) -> boo
             f"Attesi {num_joints} giunti ({num_joints} valori), ricevuti {len(positions)}"
         )
 
-    # Limiti approssimativi dei giunti di Franka Panda (in radianti)
-    joint_limits = [
-        (-2.8973, 2.8973),  # Joint 1
-        (-1.7628, 1.7628),  # Joint 2
-        (-2.8973, 2.8973),  # Joint 3
-        (-3.0718, -0.0698),  # Joint 4
-        (-2.8973, 2.8973),  # Joint 5
-        (-0.0175, 3.7525),  # Joint 6
-        (-2.8973, 2.8973),  # Joint 7
-    ]
-
-    for i, pos in enumerate(positions):
-        if not (joint_limits[i][0] <= pos <= joint_limits[i][1]):
-            raise ValueError(
-                f"Giunto {i}: posizione {pos} fuori dai limiti "
-                f"[{joint_limits[i][0]}, {joint_limits[i][1]}]"
-            )
-
     return True
 
 

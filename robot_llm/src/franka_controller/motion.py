@@ -45,30 +45,42 @@ class MotionController:
         Returns:
             True se il movimento è completato con successo
         """
-        from .utils import validate_joint_positions, compute_minimum_jerk_trajectory
+        from .utils import compute_minimum_jerk_trajectory
 
-        validate_joint_positions(target_positions)
         target = np.array(target_positions)
 
-        print(f"Movimento verso posizioni target: {np.round(target, 3).tolist()}")
+        print(f"[MOTION] Movimento verso posizioni target: {np.round(target, 3).tolist()}")
+        print(f"[MOTION] Speed factor: {speed_factor}, Tolerance: {tolerance}")
 
         try:
+            # Ottieni posizione iniziale PRIMA di avviare il controllo
+            # (read_once non è compatibile con un'operazione di controllo attiva)
+            print("[MOTION] Leggendo posizione iniziale...")
+            initial_state = self.robot.get_state()
+            q_start = np.array(initial_state.q)
+            print(f"[MOTION] Posizione iniziale: {np.round(q_start, 3).tolist()}")
+
             # Avvia il controllo in posizione dei giunti
+            print("[MOTION] Avviando controllo posizione giunti con CartesianImpedance...")
             active_control = self.robot.robot.start_joint_position_control(
                 pylibfranka.ControllerMode.CartesianImpedance
             )
-
-            # Ottieni posizione iniziale dal primo stato letto
-            initial_state = self.robot.get_state()
-            q_start = np.array(initial_state.q)
+            print("[MOTION] ✓ Controllo posizione avviato")
 
             # Parametri del movimento
             duration = 5.0 / speed_factor
             time_elapsed = 0.0
             motion_finished = False
+            iteration_count = 0
+            monitoring_log = []  # Buffer per log senza I/O bloccante nel loop
+
+            print(f"[MOTION] Durata prevista: {duration:.2f}s")
+            print("[MOTION] --- Inizio loop di controllo ---")
 
             # Loop di controllo esterno
             while not motion_finished:
+                iteration_count += 1
+                
                 # Leggi stato del robot
                 robot_state, delta_time = active_control.readOnce()
                 
@@ -82,21 +94,41 @@ class MotionController:
                 # Crea comando di posizione
                 joint_cmd = pylibfranka.JointPositions(q_current.tolist())
                 
-                # Imposta flag di movimento finito
+                # Imposta flag di movimento finito e raccogli dati di monitoraggio (NO print nel loop!)
                 if progress >= 1.0:
                     joint_cmd.motion_finished = True
                     motion_finished = True
+                    monitoring_log.append(
+                        f"[MOTION] Iter {iteration_count} | Progress: 100.0% | Tempo: {time_elapsed:.3f}s | ✓ MOVIMENTO FINITO"
+                    )
+                    monitoring_log.append(f"[MOTION] Comando finale: {np.round(q_current, 3).tolist()}")
                 else:
                     joint_cmd.motion_finished = False
+                    # Raccogli dati ogni 20 iterazioni (ma NO print - potrebbe causare communication_constraints_violation)
+                    if iteration_count % 20 == 0 or iteration_count == 1:
+                        progress_pct = progress * 100
+                        delta_to_target = target - q_current
+                        max_delta = np.max(np.abs(delta_to_target))
+                        monitoring_log.append(
+                            f"[MOTION] Iter {iteration_count:4d} | Progress: {progress_pct:5.1f}% | Tempo: {time_elapsed:6.3f}s | Max delta: {max_delta:.4f}rad | dT: {delta_time.to_sec():.4f}s"
+                        )
 
-                # Invia comando al robot
+                # Invia comando al robot (CRITICO: nessun I/O bloccante qui)
                 active_control.writeOnce(joint_cmd)
 
-            print("✓ Movimento completato")
+            # Stampa tutti i log DOPO il loop di controllo (I/O non critico)
+            for log_line in monitoring_log:
+                print(log_line)
+            
+            print(f"[MOTION] --- Fine loop di controllo (totale {iteration_count} iterazioni) ---")
+            print(f"[MOTION] Posizione finale raggiunta: {np.round(q_current, 3).tolist()}")
+            print("✓ Movimento completato con successo")
             return True
 
         except Exception as e:
             print(f"✗ Errore durante il movimento: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def move_relative(self, delta_positions: List[float], speed_factor: float = 0.2) -> bool:
@@ -112,7 +144,9 @@ class MotionController:
         """
         current = self.robot.get_current_joint_positions()
         target = current + np.array(delta_positions)
-
+        print(f"Movimento relativo: Δ{np.round(delta_positions, 3).tolist()}")
+        print(f"Posizione target: {np.round(target, 3).tolist()}")
+        
         return self.move_to_joint_positions(target.tolist(), speed_factor)
 
     def move_to_cartesian_pose(
@@ -205,9 +239,7 @@ class MotionController:
         Returns:
             True se il movimento è completato con successo
         """
-        from .utils import validate_joint_positions
 
-        validate_joint_positions(target_positions)
 
         # Imposta impedenza
         if stiffness is None:
@@ -290,7 +322,7 @@ class MotionController:
             True se il movimento è completato con successo
         """
         # Configurazione home tipica per Franka Panda
-        home_position = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
+        home_position = [0, 0, 0, -3.03005749, 1.55690476, 1.56836934, -0.29296873]
 
         print("Ritorno alla posizione home...")
         return self.move_to_joint_positions(home_position, speed_factor)

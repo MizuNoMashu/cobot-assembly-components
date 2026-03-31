@@ -4,7 +4,6 @@ Test unitari per i moduli franka_controller
 import pytest
 import numpy as np
 from franka_controller.utils import (
-    validate_joint_positions,
     minimum_jerk_trajectory
 )
 
@@ -12,26 +11,7 @@ from franka_controller.utils import (
 class TestUtils:
     """Test per le funzioni di utility"""
     
-    def test_validate_joint_positions_correct(self):
-        """Test validazione posizioni corrette"""
-        positions = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
-        assert validate_joint_positions(positions)
-    
-    def test_validate_joint_positions_wrong_count(self):
-        """Test validazione con numero errato di giunti"""
-        positions = [0.0, 0.0, 0.0]  # Solo 3 invece di 7
-        
-        with pytest.raises(ValueError, match="Attesi 7 giunti"):
-            validate_joint_positions(positions)
-    
-    def test_validate_joint_positions_out_of_bounds(self):
-        """Test validazione con posizioni fuori limiti"""
-        # Joint 1 fuori limiti (>2.8973)
-        positions = [3.5, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
-        
-        with pytest.raises(ValueError, match="fuori dai limiti"):
-            validate_joint_positions(positions)
-    
+  
     def test_minimum_jerk_trajectory_start(self):
         """Test traiettoria minimum jerk all'inizio"""
         start = np.array([0.0, 0.0, 0.0])

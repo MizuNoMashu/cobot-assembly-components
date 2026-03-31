@@ -61,7 +61,7 @@ class GripperController:
             print(f"✗ Errore durante homing: {e}")
             return False
 
-    def open(self, width: float = 0.08, speed: float = 0.1) -> bool:
+    def open(self, width: float = 0.005, speed: float = 0.1) -> bool:
         """
         Apre il gripper alla larghezza specificata.
 

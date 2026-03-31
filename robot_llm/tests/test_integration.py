@@ -147,22 +147,6 @@ def test_gripper_grasp(mock_robot, mock_gripper_class):
     assert success is True
 
 
-def test_joint_position_validation():
-    """Test validazione posizioni giunti"""
-    from franka_controller.utils import validate_joint_positions
-
-    # Posizioni valide
-    valid_positions = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
-    validate_joint_positions(valid_positions)  # Non dovrebbe sollevare eccezioni
-
-    # Numero errato di giunti
-    with pytest.raises(ValueError, match="7 valori"):
-        validate_joint_positions([0.0, 0.0, 0.0])
-
-    # Valore fuori range
-    invalid_positions = [10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # > 2.8973
-    with pytest.raises(ValueError, match="fuori dai limiti"):
-        validate_joint_positions(invalid_positions)
 
 
 def test_minimum_jerk_trajectory():

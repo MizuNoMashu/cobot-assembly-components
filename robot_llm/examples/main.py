@@ -43,7 +43,7 @@ def print_menu():
     print("=" * 60)
 
 
-def connect_robot(robot_ip: str = "172.16.0.2") -> FrankaRobot:
+def connect_robot(robot_ip: str = "172.16.0.3") -> FrankaRobot:
     """
     Connette al robot Franka.
 
@@ -418,7 +418,7 @@ def main():
     print("=" * 60)
 
     # Chiedi l'IP del robot
-    default_ip = "172.16.0.2"
+    default_ip = "172.16.0.3"
     robot_ip = input(f"Indirizzo IP del robot (default {default_ip}): ") or default_ip
 
     robot = None

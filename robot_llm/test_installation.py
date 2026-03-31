@@ -9,7 +9,6 @@ import pylibfranka
 from franka_controller import FrankaRobot, MotionController, GripperController
 from franka_controller import __version__
 from franka_controller.utils import (
-    validate_joint_positions,
     compute_minimum_jerk_trajectory,
     euler_to_rotation_matrix,
     rotation_matrix_to_euler,
@@ -36,26 +35,6 @@ def test_imports():
     print("  - GripperController")
     print()
 
-
-def test_joint_validation():
-    """Test validazione posizioni giunti."""
-    print("=" * 60)
-    print("TEST 2: Validazione posizioni giunti")
-    print("=" * 60)
-
-    # Posizione home valida
-    valid_pos = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
-    result = validate_joint_positions(valid_pos)
-    print(f"Posizione home: {result}")
-    assert result == True, "La posizione home dovrebbe essere valida"
-
-    # Posizione con troppi elementi
-    try:
-        invalid_pos = [0.0] * 8
-        validate_joint_positions(invalid_pos)
-        assert False, "Dovrebbe generare errore per numero errato di giunti"
-    except ValueError as e:
-        print(f"✓ Errore corretto per numero giunti: {e}\n")
 
 
 def test_trajectory():

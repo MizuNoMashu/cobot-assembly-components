@@ -14,7 +14,7 @@ echo -e "${BLUE}  Installazione pylibfranka da sorgenti${NC}"
 echo -e "${BLUE}========================================${NC}"
 
 # Check prerequisites
-echo -e "\n${YELLOW}[1/7]${NC} Verifica prerequisiti..."
+echo -e "\n${YELLOW}[1/8]${NC} Verifica prerequisiti..."
 
 if ! command -v cmake &> /dev/null; then
     echo -e "${RED}✗ CMake non trovato${NC}"
@@ -90,7 +90,7 @@ python3 -m pip install -U pip setuptools wheel numpy pybind11
 
 # Clone repository
 INSTALL_DIR="${HOME}/libfranka_build"
-echo -e "\n${YELLOW}[2/7]${NC} Clone repository in ${INSTALL_DIR}..."
+echo -e "\n${YELLOW}[2/8]${NC} Clone repository in ${INSTALL_DIR}..."
 
 if [ -d "$INSTALL_DIR" ]; then
     echo -e "${YELLOW}⚠ Directory già esistente. Rimuovo...${NC}"
@@ -101,9 +101,46 @@ git clone --recursive https://github.com/frankarobotics/libfranka.git "$INSTALL_
 cd "$INSTALL_DIR"
 
 # Checkout version
-echo -e "\n${YELLOW}[3/7]${NC} Checkout versione 0.16.0..."
+echo -e "\n${YELLOW}[3/8]${NC} Checkout versione 0.16.0..."
 git checkout 0.16.0
 git submodule update --init --recursive
+
+# Install pinocchio (required for pylibfranka)
+echo -e "\n${YELLOW}[4/9]${NC} Installazione pinocchio (dipendenza pylibfranka)..."
+PINOCCHIO_DIR="/tmp/pinocchio_build"
+
+if [ -d "$PINOCCHIO_DIR" ]; then
+    echo -e "${YELLOW}Rimozione build pinocchio precedente...${NC}"
+    rm -rf "$PINOCCHIO_DIR"
+fi
+
+echo -e "${BLUE}Clonazione pinocchio...${NC}"
+git clone https://github.com/stack-of-tasks/pinocchio.git "$PINOCCHIO_DIR"
+cd "$PINOCCHIO_DIR"
+
+echo -e "${BLUE}Build pinocchio...${NC}"
+cmake -S . -B ./build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_TESTING=OFF \
+      -DBUILD_EXAMPLES=OFF \
+      -DBUILD_BENCHMARK=OFF \
+      -DBUILD_PYTHON_INTERFACE=OFF \
+      -DBUILD_WITH_COLLISION_SUPPORT=OFF
+
+cmake --build ./build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
+
+echo -e "${BLUE}Installazione pinocchio...${NC}"
+sudo cmake --install ./build
+
+# Verifica installazione pinocchio
+if pkg-config --modversion pinocchio 2>/dev/null; then
+    echo -e "${GREEN}✓ Pinocchio installato correttamente (versione: $(pkg-config --modversion pinocchio))${NC}"
+else
+    echo -e "${RED}✗ Errore nell'installazione di pinocchio${NC}"
+    exit 1
+fi
+
+cd "$INSTALL_DIR"
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
     echo -e "${YELLOW}Patch macOS: uso TCP_KEEPALIVE al posto di TCP_KEEPIDLE${NC}"
@@ -126,7 +163,7 @@ PY
 fi
 
 # Build libfranka
-echo -e "\n${YELLOW}[4/7]${NC} Build libfranka (può richiedere alcuni minuti)..."
+echo -e "\n${YELLOW}[5/9]${NC} Build libfranka (può richiedere alcuni minuti)..."
 
 # Rimuovi build precedente se esiste
 if [ -d "build" ]; then
@@ -161,7 +198,7 @@ fi
 cmake --build . -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
 
 # Optional: Install system-wide
-echo -e "\n${YELLOW}[5/7]${NC} Installa libfranka a livello di sistema? [y/N]"
+echo -e "\n${YELLOW}[6/9]${NC} Installa libfranka a livello di sistema? [y/N]"
 read -r response
 if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
     sudo cmake --install .
@@ -171,7 +208,7 @@ else
 fi
 
 # Install pylibfranka
-echo -e "\n${YELLOW}[6/7]${NC} Installazione pylibfranka con pip..."
+echo -e "\n${YELLOW}[7/9]${NC} Installazione pylibfranka con pip..."
 cd "$INSTALL_DIR"
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -192,8 +229,41 @@ fi
 
 python3 -m pip install --no-build-isolation .
 
+# Fix per LD_LIBRARY_PATH nel virtual environment
+echo -e "\n${YELLOW}[8/9]${NC} Configurazione LD_LIBRARY_PATH per pinocchio..."
+
+# Trova il file di attivazione del virtual environment
+VENV_ACTIVATE="$VIRTUAL_ENV/bin/activate"
+if [ -f "$VENV_ACTIVATE" ]; then
+    # Aggiungi LD_LIBRARY_PATH se non già presente
+    if ! grep -q "LD_LIBRARY_PATH.*pinocchio" "$VENV_ACTIVATE"; then
+        echo -e "${BLUE}Aggiunta LD_LIBRARY_PATH al virtual environment...${NC}"
+        
+        # Trova la riga di esportazione PATH e aggiungi dopo
+        sed -i.bak "/export PATH/a\\
+# Add pinocchio library path\\
+_OLD_VIRTUAL_LD_LIBRARY_PATH=\"\${LD_LIBRARY_PATH:-}\"\\
+LD_LIBRARY_PATH=\"/usr/local/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\"\\
+export LD_LIBRARY_PATH" "$VENV_ACTIVATE"
+        
+        # Aggiungi il ripristino nella funzione deactivate
+        sed -i.bak "/unset _OLD_VIRTUAL_PATH/i\\
+    if [ -n \"\${_OLD_VIRTUAL_LD_LIBRARY_PATH:-}\" ] ; then\\
+        LD_LIBRARY_PATH=\"\${_OLD_VIRTUAL_LD_LIBRARY_PATH:-}\"\\
+        export LD_LIBRARY_PATH\\
+        unset _OLD_VIRTUAL_LD_LIBRARY_PATH\\
+    fi" "$VENV_ACTIVATE"
+        
+        echo -e "${GREEN}✓ LD_LIBRARY_PATH configurato nel virtual environment${NC}"
+    else
+        echo -e "${BLUE}LD_LIBRARY_PATH già configurato${NC}"
+    fi
+else
+    echo -e "${YELLOW}⚠ Virtual environment non trovato, configurazione manuale richiesta${NC}"
+fi
+
 # Verify
-echo -e "\n${YELLOW}[7/7]${NC} Verifica installazione..."
+echo -e "\n${YELLOW}[9/9]${NC} Verifica installazione..."
 cd /tmp  # Cambia directory per evitare import dal sorgente invece che da site-packages
 if python3 -c "import pylibfranka" 2>&1; then
     echo -e "${GREEN}✓✓✓ pylibfranka installato con successo!${NC}"
