@@ -9,6 +9,8 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+sudo apt-get update
+sudo apt-get install -y build-essential cmake libeigen3-dev libpoco-dev python3-dev liburdfdom-dev liburdfdom-headers-dev libboost-filesystem-dev libboost-serialization-dev libboost-system-dev libboost-program-options-dev libtinyxml2-dev
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}  Installazione pylibfranka da sorgenti${NC}"
 echo -e "${BLUE}========================================${NC}"
@@ -101,8 +103,9 @@ git clone --recursive https://github.com/frankarobotics/libfranka.git "$INSTALL_
 cd "$INSTALL_DIR"
 
 # Checkout version
-echo -e "\n${YELLOW}[3/8]${NC} Checkout versione 0.16.0..."
-git checkout 0.16.0
+PYLIBFRANKA_VERSION=${PYLIBFRANKA_VERSION:-0.21.1}
+echo -e "\n${YELLOW}[3/8]${NC} Checkout versione ${PYLIBFRANKA_VERSION}..."
+git checkout ${PYLIBFRANKA_VERSION}
 git submodule update --init --recursive
 
 # Install pinocchio (required for pylibfranka)

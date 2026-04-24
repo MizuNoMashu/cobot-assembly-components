@@ -1,0 +1,25 @@
+✗ Robot entrato in ERROR_LOCKED.
+Operazione: motion/move_to_joint_positions
+Tipo errore: command_error
+Messaggio: libfranka: Move command aborted: motion aborted by reflex! ["cartesian_reflex"]
+✗ Errore durante il movimento: libfranka: Move command aborted: motion aborted by reflex! ["cartesian_reflex"]
+Traceback (most recent call last):
+  File "/home/xrlab/Development/cobot-assembly-components/robot_llm/src/franka_controller/motion.py", line 103, in move_to_joint_positions
+    robot_state, delta_time = active_control.readOnce()
+pylibfranka._pylibfranka.ControlException: libfranka: Move command aborted: motion aborted by reflex! ["cartesian_reflex"]
+
+
+
+ Robot entrato in ERROR_LOCKED.
+Operazione: motion/move_to_joint_positions
+Tipo errore: unknown_error
+Messaggio: Movimento terminato ma tolleranza non rispettata. Errore massimo reale: 0.031430 rad, tolleranza: 0.010000 rad.
+✗ Errore durante il movimento: Movimento terminato ma tolleranza non rispettata. Errore massimo reale: 0.031430 rad, tolleranza: 0.010000 rad.
+Traceback (most recent call last):
+  File "/home/xrlab/Development/cobot-assembly-components/robot_llm/src/franka_controller/motion.py", line 175, in move_to_joint_positions
+    raise RuntimeError(
+RuntimeError: Movimento terminato ma tolleranza non rispettata. Errore massimo reale: 0.031430 rad, tolleranza: 0.010000 rad.
+
+
+
+start_torque_control

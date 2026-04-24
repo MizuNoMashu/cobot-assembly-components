@@ -9,31 +9,39 @@ sudo apt-get update
 sudo apt-get install -y build-essential cmake libeigen3-dev libpoco-dev python3-dev
 ```
 
-### 2. Installazione pylibfranka (OBBLIGATORIA DA SORGENTI)
+### 2. Installazione pylibfranka (consigliata ultima release)
 
-⚠️ **pylibfranka NON è su PyPI** - deve essere compilato:
+⚠️ **pylibfranka** è ora disponibile anche su PyPI, ma per stabilità e compatibilità robot si raccomanda la compilazione dal sorgente con l’ultima release testata.
 
+Opzione A (da PyPI):
+```bash
+pip install -U pylibfranka
+python3 -c "import pylibfranka; print('OK', pylibfranka.__version__)"
+```
+
+Opzione B (da sorgente, raccomandata per controllo versione):
 ```bash
 # Clona e compila libfranka + pylibfranka
 git clone --recursive https://github.com/frankarobotics/libfranka.git
 cd libfranka
-git checkout 0.16.0
+# usa l'ultima release stabile o un tag specifico che vuoi
+git checkout 0.21.1
 git submodule update --init --recursive
 
 # Build libfranka (libreria C++)
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF ..
-cmake --build . -j4
+cmake --build . -j$(nproc)
 
 # Installa pylibfranka
 cd ../pylibfranka
 pip install .
 
 # Verifica
-python3 -c "import pylibfranka; print('OK')"
+python3 -c "import pylibfranka; print('OK', pylibfranka.__version__)"
 ```
 
-Documentazione: https://github.com/frankarobotics/libfranka/tree/0.16.0/pylibfranka
+Documentazione: https://github.com/frankarobotics/libfranka/tree/v0.21.1/pylibfranka
 
 ### 3. Installazione del progetto
 ```bash

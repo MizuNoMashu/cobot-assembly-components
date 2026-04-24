@@ -8,8 +8,9 @@ lettura dello stato, e workflow completi.
 """
 
 import sys
+import traceback
 import numpy as np
-from franka_controller import FrankaRobot
+from franka_controller import FrankaRobot,RobotError, RobotErrorType, RobotMode, GripperError, GripperErrorType, GripperMode
 
 pose1 = [0.1601747338677177, -0.13314153275982454, -0.23210223978843075, -2.282551255319605, 1.4401673292125021, 1.7223496288987419, 0.227743905258227]
 pose2 = [0.24331267448521512, -0.1008804753139512, -0.16947217878813267, -2.3149512770949685, 1.4401392707139342, 1.7219941665734733, 0.22701246033680494]
@@ -19,49 +20,133 @@ poses_default = {
     "2": pose2,
     "3": pose3
 }
-def print_menu():
+def print_menu(robot=None):
     """Stampa il menu principale."""
+
     print("\n" + "=" * 60)
     print("MENU PRINCIPALE - FRANKA ROBOT CONTROLLER")
+    print("=" * 60)
+
+    if robot is not None:
+        print(f"Robot mode:   {robot.mode.value}")
+
+        if hasattr(robot, "gripper") and robot.gripper is not None:
+            print(f"Gripper mode: {robot.gripper.mode.value}")
+
+        if robot.last_error is not None:
+            print(
+                f"Last robot error: "
+                f"{robot.last_error.error_type.value} | "
+                f"{robot.last_error.operation}"
+            )
+
+        if hasattr(robot, "gripper") and robot.gripper.last_error is not None:
+            print(
+                f"Last gripper error: "
+                f"{robot.gripper.last_error.error_type.value} | "
+                f"{robot.gripper.last_error.operation}"
+            )
+
+    else:
+        print("Robot mode:   not connected")
+        print("Gripper mode: not connected")
+
     print("=" * 60)
     print("1. Connetti al robot")
     print("2. Mostra stato del robot")
     print("3. Mostra stato del gripper")
     print("4. Vai alla posizione home")
-    print("5. Movimento dei giunti (custom)")
+    print("5. Movimento dei giunti custom")
     print("6. Movimento relativo dei giunti")
     print("7. Controllo impedenza")
     print("8. Homing del gripper")
     print("9. Apri gripper")
     print("10. Chiudi gripper")
-    print("11. Afferra oggetto (grasp)")
+    print("11. Afferra oggetto")
     print("12. Rilascia oggetto")
-    print("13. Workflow: Pick-and-Place")
+    print("13. Workflow Pick-and-Place")
     print("14. Configura collision behavior")
-    print("15. Recovery automatico da errori")
+    print("15. Recovery automatico robot")
+    print("16. Mostra errori robot")
+    print("17. Mostra errori gripper")
+    print("18. Svuota errori robot")
+    print("19. Svuota errori gripper")
+    print("20. Reset software lock gripper")
+    print("21. Riconnetti gripper")
     print("0. Esci")
     print("=" * 60)
-
-
-def connect_robot(robot_ip: str = "172.16.0.3") -> FrankaRobot:
-    """
-    Connette al robot Franka.
-
-    Args:
-        robot_ip: Indirizzo IP del robot
-
-    Returns:
-        Istanza di FrankaRobot connessa
-    """
+def connect_robot(
+    robot_ip: str = "172.16.0.3",
+    enforce_realtime: bool = True,
+) -> FrankaRobot | None:
     try:
         print(f"\n[Connessione al robot {robot_ip}...]")
-        robot = FrankaRobot(robot_ip)
+        print(f"[Realtime enforce: {enforce_realtime}]")
+
+        robot = FrankaRobot(
+            robot_ip=robot_ip,
+            enforce_realtime=enforce_realtime,
+        )
+
         print("✓ Robot connesso con successo!")
         return robot
+
     except Exception as e:
         print(f"✗ Errore di connessione: {e}")
+        traceback.print_exc()
         return None
+def show_robot_errors(robot: FrankaRobot):
+    if robot is None:
+        print("✗ Robot non connesso!")
+        return
 
+    robot.print_errors()
+
+
+def show_gripper_errors(robot: FrankaRobot):
+    if robot is None:
+        print("✗ Robot non connesso!")
+        return
+
+    robot.gripper.print_errors()
+
+
+def clear_robot_errors(robot: FrankaRobot):
+    if robot is None:
+        print("✗ Robot non connesso!")
+        return
+
+    robot.clear_errors()
+
+
+def clear_gripper_errors(robot: FrankaRobot):
+    if robot is None:
+        print("✗ Robot non connesso!")
+        return
+
+    robot.gripper.clear_errors()
+
+
+def reset_gripper_lock(robot: FrankaRobot):
+    if robot is None:
+        print("✗ Robot non connesso!")
+        return
+
+    try:
+        robot.gripper.reset_error_lock()
+    except Exception as e:
+        print(f"✗ Errore reset gripper lock: {e}")
+
+
+def reconnect_gripper(robot: FrankaRobot):
+    if robot is None:
+        print("✗ Robot non connesso!")
+        return
+
+    try:
+        robot.gripper.reconnect()
+    except Exception as e:
+        print(f"✗ Errore riconnessione gripper: {e}")
 
 def show_robot_state(robot: FrankaRobot):
     """Mostra lo stato del robot."""
@@ -231,7 +316,7 @@ def gripper_open(robot: FrankaRobot):
         return
 
     try:
-        width_mm = float(input("Larghezza apertura in mm (default 80): ") or "80")
+        width_mm = float(input("Larghezza apertura in mm (default 80): ") or float("80"))
         width_m = width_mm / 1000.0
         speed = float(input("Velocità in m/s (default 0.1): ") or "0.1")
 
@@ -410,21 +495,21 @@ def automatic_recovery(robot: FrankaRobot):
     except Exception as e:
         print(f"✗ Errore: {e}")
 
-
 def main():
-    """Funzione principale con il loop del menu."""
     print("=" * 60)
     print("FRANKA ROBOT CONTROLLER - Menu Interattivo")
     print("=" * 60)
 
-    # Chiedi l'IP del robot
     default_ip = "172.16.0.3"
     robot_ip = input(f"Indirizzo IP del robot (default {default_ip}): ") or default_ip
+
+    enforce_input = input("Usare kEnforce realtime? (Y/n): ").lower()
+    enforce_realtime = enforce_input != "n"
 
     robot = None
 
     while True:
-        print_menu()
+        print_menu(robot)
 
         try:
             choice = input("\nScegli un'opzione: ")
@@ -437,7 +522,10 @@ def main():
                 sys.exit(0)
 
             elif choice == "1":
-                robot = connect_robot(robot_ip)
+                robot = connect_robot(
+                    robot_ip=robot_ip,
+                    enforce_realtime=enforce_realtime,
+                )
 
             elif choice == "2":
                 show_robot_state(robot)
@@ -481,22 +569,44 @@ def main():
             elif choice == "15":
                 automatic_recovery(robot)
 
+            elif choice == "16":
+                show_robot_errors(robot)
+
+            elif choice == "17":
+                show_gripper_errors(robot)
+
+            elif choice == "18":
+                clear_robot_errors(robot)
+
+            elif choice == "19":
+                clear_gripper_errors(robot)
+
+            elif choice == "20":
+                reset_gripper_lock(robot)
+
+            elif choice == "21":
+                reconnect_gripper(robot)
+
             else:
                 print("✗ Opzione non valida!")
 
         except KeyboardInterrupt:
             print("\n\n[Interruzione con Ctrl+C]")
+
             if robot is not None:
+                try:
+                    print("Tentativo stop gripper...")
+                    robot.gripper.stop()
+                except Exception:
+                    pass
+
                 print("Disconnessione dal robot...")
+
             print("Arrivederci!")
             sys.exit(0)
 
         except Exception as e:
             print(f"\n✗ Errore imprevisto: {e}")
-            import traceback
-
             traceback.print_exc()
-
-
 if __name__ == "__main__":
     main()

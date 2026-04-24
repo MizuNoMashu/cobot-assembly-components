@@ -3,152 +3,247 @@ Controller per il movimento del robot Franka usando pylibfranka.
 Fornisce interfacce ad alto livello per movimenti in spazio dei giunti e cartesiano.
 """
 
-import time
+import traceback
 import numpy as np
-from typing import List, Optional, Callable, Dict
+from typing import List, Optional, Callable
+
 import pylibfranka
+
 
 class MotionController:
     """
     Controller per gestire il movimento del robot Franka con pylibfranka.
-
-    Fornisce funzioni per:
-    - Controllo in posizione dei giunti tramite motion generators
-    - Controllo di velocità dei giunti
-    - Controllo di impedenza cartesiana
-    - Movimento basato su coordinate cartesiane (con inverse kinematics approssimata)
     """
 
     def __init__(self, franka_robot):
         """
-        Inizializza il controller di movimento.
-
         Args:
             franka_robot: Istanza di FrankaRobot
         """
         self.robot = franka_robot
 
+    # ------------------------------------------------------------
+    # Internal utilities
+    # ------------------------------------------------------------
+
+    def _validate_joint_vector(self, values: List[float], name: str) -> None:
+        if len(values) != 7:
+            raise ValueError(
+                f"{name} deve contenere 7 valori, ricevuti {len(values)}."
+            )
+
+    def _validate_speed_factor(self, speed_factor: float) -> None:
+        if speed_factor <= 0.0 or speed_factor > 1.0:
+            raise ValueError(
+                f"speed_factor non valido: {speed_factor}. "
+                "Deve essere nel range (0.0, 1.0]."
+            )
+
+    def _validate_duration(self, duration: float) -> None:
+        if duration <= 0.0:
+            raise ValueError(
+                f"duration non valida: {duration}. Deve essere positiva."
+            )
+
+    # ------------------------------------------------------------
+    # Joint position control
+    # ------------------------------------------------------------
+
     def move_to_joint_positions(
         self,
         target_positions: List[float],
         speed_factor: float = 0.2,
-        tolerance: float = 0.01,
+        tolerance: float = 0.04,
     ) -> bool:
         """
-        Muove il robot verso una configurazione target dei giunti usando un controllo esterno.
-        Muove il robot verso una configurazione target dei giunti usando un controllo esterno.
-
-        Args:
-            target_positions: Lista di 7 posizioni target in radianti
-            speed_factor: Fattore di velocità (0.0 - 1.0)
-            tolerance: Tolleranza per considerare la posizione raggiunta [rad]
-
-        Returns:
-            True se il movimento è completato con successo
+        Muove il robot verso una configurazione target dei giunti.
         """
         from .utils import compute_minimum_jerk_trajectory
 
-        target = np.array(target_positions)
-
-        print(f"[MOTION] Movimento verso posizioni target: {np.round(target, 3).tolist()}")
-        print(f"[MOTION] Speed factor: {speed_factor}, Tolerance: {tolerance}")
+        self.robot._ensure_can_command()
 
         try:
-            # Ottieni posizione iniziale PRIMA di avviare il controllo
-            # (read_once non è compatibile con un'operazione di controllo attiva)
+            self._validate_joint_vector(target_positions, "target_positions")
+            self._validate_speed_factor(speed_factor)
+
+            target = np.array(target_positions)
+
+            print(
+                f"[MOTION] Movimento verso posizioni target: "
+                f"{np.round(target, 3).tolist()}"
+            )
+            print(f"[MOTION] Speed factor: {speed_factor}, Tolerance: {tolerance}")
+
             print("[MOTION] Leggendo posizione iniziale...")
             initial_state = self.robot.get_state()
             q_start = np.array(initial_state.q)
+
             print(f"[MOTION] Posizione iniziale: {np.round(q_start, 3).tolist()}")
 
-            # Avvia il controllo in posizione dei giunti
-            print("[MOTION] Avviando controllo posizione giunti con CartesianImpedance...")
+            self.robot.mode = self.robot.mode.__class__.RUNNING
+
+            print("[MOTION] Avviando controllo posizione giunti...")
             active_control = self.robot.robot.start_joint_position_control(
                 pylibfranka.ControllerMode.CartesianImpedance
             )
             print("[MOTION] ✓ Controllo posizione avviato")
 
-            # Parametri del movimento
             duration = 5.0 / speed_factor
             time_elapsed = 0.0
             motion_finished = False
             iteration_count = 0
-            monitoring_log = []  # Buffer per log senza I/O bloccante nel loop
+            monitoring_log = []
 
             print(f"[MOTION] Durata prevista: {duration:.2f}s")
             print("[MOTION] --- Inizio loop di controllo ---")
 
-            # Loop di controllo esterno
             while not motion_finished:
                 iteration_count += 1
-                
-                # Leggi stato del robot
+
                 robot_state, delta_time = active_control.readOnce()
-                
-                # Aggiorna tempo
+                cartesian_contact = np.array(robot_state.cartesian_contact, dtype=bool)
+                cartesian_collision = np.array(robot_state.cartesian_collision, dtype=bool)
+
+                if np.any(cartesian_collision):
+                    hold_cmd = pylibfranka.JointPositions(list(robot_state.q))
+                    hold_cmd.motion_finished = True
+                    active_control.writeOnce(hold_cmd)
+                    raise RuntimeError(...)
+
+                if np.any(cartesian_contact):
+                    hold_cmd = pylibfranka.JointPositions(list(robot_state.q))
+                    hold_cmd.motion_finished = True
+                    active_control.writeOnce(hold_cmd)
+                    raise RuntimeError(...)
+
                 time_elapsed += delta_time.to_sec()
                 progress = min(time_elapsed / duration, 1.0)
 
-                # Calcola posizione intermedia con traiettoria minimum jerk
-                q_current = q_start + (target - q_start) * compute_minimum_jerk_trajectory(progress)
+                s = compute_minimum_jerk_trajectory(progress)
+                q_current = q_start + (target - q_start) * s
 
-                # Crea comando di posizione
                 joint_cmd = pylibfranka.JointPositions(q_current.tolist())
-                
-                # Imposta flag di movimento finito e raccogli dati di monitoraggio (NO print nel loop!)
+
                 if progress >= 1.0:
                     joint_cmd.motion_finished = True
                     motion_finished = True
+
                     monitoring_log.append(
-                        f"[MOTION] Iter {iteration_count} | Progress: 100.0% | Tempo: {time_elapsed:.3f}s | ✓ MOVIMENTO FINITO"
+                        f"[MOTION] Iter {iteration_count} | "
+                        f"Progress: 100.0% | Tempo: {time_elapsed:.3f}s | "
+                        f"✓ MOVIMENTO FINITO"
                     )
-                    monitoring_log.append(f"[MOTION] Comando finale: {np.round(q_current, 3).tolist()}")
+                    monitoring_log.append(
+                        f"[MOTION] Comando finale: "
+                        f"{np.round(q_current, 3).tolist()}"
+                    )
+
                 else:
                     joint_cmd.motion_finished = False
-                    # Raccogli dati ogni 20 iterazioni (ma NO print - potrebbe causare communication_constraints_violation)
+
                     if iteration_count % 20 == 0 or iteration_count == 1:
                         progress_pct = progress * 100
                         delta_to_target = target - q_current
                         max_delta = np.max(np.abs(delta_to_target))
+
                         monitoring_log.append(
-                            f"[MOTION] Iter {iteration_count:4d} | Progress: {progress_pct:5.1f}% | Tempo: {time_elapsed:6.3f}s | Max delta: {max_delta:.4f}rad | dT: {delta_time.to_sec():.4f}s"
+                            f"[MOTION] Iter {iteration_count:4d} | "
+                            f"Progress: {progress_pct:5.1f}% | "
+                            f"Tempo: {time_elapsed:6.3f}s | "
+                            f"Max delta: {max_delta:.4f} rad | "
+                            f"dT: {delta_time.to_sec():.4f}s"
                         )
 
-                # Invia comando al robot (CRITICO: nessun I/O bloccante qui)
                 active_control.writeOnce(joint_cmd)
 
-            # Stampa tutti i log DOPO il loop di controllo (I/O non critico)
             for log_line in monitoring_log:
                 print(log_line)
-            
-            print(f"[MOTION] --- Fine loop di controllo (totale {iteration_count} iterazioni) ---")
-            print(f"[MOTION] Posizione finale raggiunta: {np.round(q_current, 3).tolist()}")
+
+            # Lettura dello stato reale finale del robot.
+            # Nota: questa lettura viene fatta DOPO la fine del controllo attivo.
+            final_state = self.robot.get_state()
+            q_final_real = np.array(final_state.q)
+
+            final_error_vector = target - q_final_real
+            final_error = np.max(np.abs(final_error_vector))
+
+            print(
+                f"[MOTION] --- Fine loop di controllo "
+                f"(totale {iteration_count} iterazioni) ---"
+            )
+            print(
+                f"[MOTION] Posizione finale comandata: "
+                f"{np.round(q_current, 3).tolist()}"
+            )
+            print(
+                f"[MOTION] Posizione finale reale: "
+                f"{np.round(q_final_real, 3).tolist()}"
+            )
+            print(
+                f"[MOTION] Errore finale per giunto: "
+                f"{np.round(final_error_vector, 6).tolist()} rad"
+            )
+            print(f"[MOTION] Errore finale massimo reale: {final_error:.6f} rad")
+
+            if final_error > tolerance:
+                raise RuntimeError(
+                    f"Movimento terminato ma tolleranza non rispettata. "
+                    f"Errore massimo reale: {final_error:.6f} rad, "
+                    f"tolleranza: {tolerance:.6f} rad."
+                )
+
+            self.robot.mode = self.robot.mode.__class__.READY
+
             print("✓ Movimento completato con successo")
             return True
 
         except Exception as e:
-            print(f"✗ Errore durante il movimento: {e}")
-            import traceback
+            error = self.robot._enter_error_locked(
+                operation="motion/move_to_joint_positions",
+                exception=e,
+                recoverable=True,
+            )
+
+            print(f"✗ Errore durante il movimento: {error.message}")
             traceback.print_exc()
             return False
 
-    def move_relative(self, delta_positions: List[float], speed_factor: float = 0.2) -> bool:
-        """
-        Muove il robot in modo relativo rispetto alla posizione corrente.
+    # ------------------------------------------------------------
+    # Relative joint motion
+    # ------------------------------------------------------------
 
-        Args:
-            delta_positions: Incrementi per ogni giunto in radianti
-            speed_factor: Fattore di velocità
+    def move_relative(
+        self,
+        delta_positions: List[float],
+        speed_factor: float = 0.2,
+    ) -> bool:
+        self.robot._ensure_can_command()
 
-        Returns:
-            True se il movimento è completato con successo
-        """
-        current = self.robot.get_current_joint_positions()
-        target = current + np.array(delta_positions)
-        print(f"Movimento relativo: Δ{np.round(delta_positions, 3).tolist()}")
-        print(f"Posizione target: {np.round(target, 3).tolist()}")
-        
-        return self.move_to_joint_positions(target.tolist(), speed_factor)
+        try:
+            self._validate_joint_vector(delta_positions, "delta_positions")
+            self._validate_speed_factor(speed_factor)
+
+            current = self.robot.get_current_joint_positions()
+            target = current + np.array(delta_positions)
+
+            print(f"Movimento relativo: Δ{np.round(delta_positions, 3).tolist()}")
+            print(f"Posizione target: {np.round(target, 3).tolist()}")
+
+            return self.move_to_joint_positions(target.tolist(), speed_factor)
+
+        except Exception as e:
+            error = self.robot._enter_error_locked(
+                operation="motion/move_relative",
+                exception=e,
+                recoverable=True,
+            )
+
+            print(f"✗ Errore durante movimento relativo: {error.message}")
+            return False
+
+    # ------------------------------------------------------------
+    # Cartesian placeholder
+    # ------------------------------------------------------------
 
     def move_to_cartesian_pose(
         self,
@@ -160,28 +255,30 @@ class MotionController:
         yaw: float = 0.0,
         speed_factor: float = 0.2,
     ) -> bool:
-        """
-        Muove l'end-effector verso una posa cartesiana target.
+        self.robot._ensure_can_command()
 
-        NOTA: Questa è un'implementazione semplificata che usa inverse kinematics numerica
-        o differenziale. Per IK più robusta, considera di usare librerie esterne come PyKDL.
+        try:
+            self._validate_speed_factor(speed_factor)
 
-        Args:
-            x, y, z: Coordinate cartesiane in metri
-            roll, pitch, yaw: Orientamento in radianti (Euler angles ZYX)
-            speed_factor: Fattore di velocità (0.0 - 1.0)
+            print(
+                f"Movimento verso posa cartesiana: "
+                f"x={x:.3f}, y={y:.3f}, z={z:.3f}, "
+                f"roll={roll:.3f}, pitch={pitch:.3f}, yaw={yaw:.3f}"
+            )
 
-        Returns:
-            True se il movimento è completato con successo
-        """
-        print(
-            f"Movimento verso posa cartesiana: x={x:.3f}, y={y:.3f}, z={z:.3f}, "
-            + f"roll={roll:.3f}, pitch={pitch:.3f}, yaw={yaw:.3f}"
-        )
+            raise NotImplementedError(
+                "Movimento cartesiano non implementato: serve inverse kinematics."
+            )
 
-        print("⚠ Movimento cartesiano richiede inverse kinematics (non implementata)")
-        print("  Usa move_to_joint_positions con configurazione pre-calcolata")
-        return False
+        except Exception as e:
+            error = self.robot._enter_error_locked(
+                operation="motion/move_to_cartesian_pose",
+                exception=e,
+                recoverable=False,
+            )
+
+            print(f"✗ Errore movimento cartesiano: {error.message}")
+            return False
 
     def move_cartesian_relative(
         self,
@@ -193,32 +290,44 @@ class MotionController:
         dyaw: float = 0.0,
         speed_factor: float = 0.2,
     ) -> bool:
-        """
-        Muove l'end-effector relativamente alla posizione corrente.
+        self.robot._ensure_can_command()
 
-        Args:
-            dx, dy, dz: Delta di posizione in metri
-            droll, dpitch, dyaw: Delta di orientamento in radianti
-            speed_factor: Fattore di velocità
+        try:
+            current_pose = self.robot.get_current_cartesian_pose()
+            current_pos = current_pose[:3, 3]
 
-        Returns:
-            True se il movimento è completato con successo
-        """
-        # Ottieni posa corrente
-        current_pose = self.robot.get_current_cartesian_pose()
-        current_pos = current_pose[:3, 3]
+            target_x = current_pos[0] + dx
+            target_y = current_pos[1] + dy
+            target_z = current_pos[2] + dz
 
-        # Calcola posa target
-        target_x = current_pos[0] + dx
-        target_y = current_pos[1] + dy
-        target_z = current_pos[2] + dz
+            print(
+                f"Movimento cartesiano relativo: "
+                f"dx={dx:.3f}, dy={dy:.3f}, dz={dz:.3f}"
+            )
 
-        # Per ora ignoriamo i delta di orientamento
-        print(f"Movimento cartesiano relativo: dx={dx:.3f}, dy={dy:.3f}, dz={dz:.3f}")
+            return self.move_to_cartesian_pose(
+                target_x,
+                target_y,
+                target_z,
+                droll,
+                dpitch,
+                dyaw,
+                speed_factor,
+            )
 
-        return self.move_to_cartesian_pose(
-            target_x, target_y, target_z, droll, dpitch, dyaw, speed_factor
-        )
+        except Exception as e:
+            error = self.robot._enter_error_locked(
+                operation="motion/move_cartesian_relative",
+                exception=e,
+                recoverable=False,
+            )
+
+            print(f"✗ Errore movimento cartesiano relativo: {error.message}")
+            return False
+
+    # ------------------------------------------------------------
+    # Impedance control
+    # ------------------------------------------------------------
 
     def impedance_control(
         self,
@@ -226,58 +335,60 @@ class MotionController:
         stiffness: Optional[List[float]] = None,
         duration: float = 5.0,
     ) -> bool:
-        """
-        Esegue un movimento con controllo impedenza dei giunti.
+        self.robot._ensure_can_command()
 
-        Imposta l'impedenza e poi muove verso la configurazione target usando
-        un motion generator.
+        try:
+            self._validate_joint_vector(target_positions, "target_positions")
+            self._validate_duration(duration)
 
-        Args:
-            target_positions: Posizioni target dei giunti [rad]
-            stiffness: Rigidità dei giunti [Nm/rad]. Se None, usa valori di default
-            duration: Durata del movimento in secondi
+            if stiffness is None:
+                stiffness = [600, 600, 600, 600, 250, 150, 50]
 
-        Returns:
-            True se il movimento è completato con successo
-        """
+            self._validate_joint_vector(stiffness, "stiffness")
 
+            self.robot.set_joint_impedance(stiffness)
 
-        # Imposta impedenza
-        if stiffness is None:
-            stiffness = [600, 600, 600, 600, 250, 150, 50]  # Valori di default
+            print(
+                f"Controllo impedenza verso: "
+                f"{np.round(target_positions, 3).tolist()}"
+            )
+            print(f"Stiffness: {stiffness}")
 
-        self.robot.set_joint_impedance(stiffness)
+            speed_factor = min(0.5, 5.0 / duration)
 
-        print(f"Controllo impedenza verso: {np.round(target_positions, 3).tolist()}")
-        print(f"Stiffness: {stiffness}")
+            return self.move_to_joint_positions(
+                target_positions,
+                speed_factor=speed_factor,
+            )
 
-        # Muovi con velocità adattata alla durata
-        speed_factor = min(0.5, 5.0 / duration) if duration > 0 else 0.2
+        except Exception as e:
+            error = self.robot._enter_error_locked(
+                operation="motion/impedance_control",
+                exception=e,
+                recoverable=True,
+            )
 
-        return self.move_to_joint_positions(target_positions, speed_factor)
+            print(f"✗ Errore durante impedance_control: {error.message}")
+            return False
+
+    # ------------------------------------------------------------
+    # Velocity control
+    # ------------------------------------------------------------
 
     def velocity_control(
         self,
         velocity_callback: Callable[[pylibfranka.RobotState, float], List[float]],
         duration: float = 5.0,
     ) -> bool:
-        """
-        Esegue controllo di velocità dei giunti usando un callback.
-
-        Args:
-            velocity_callback: Funzione che riceve (RobotState, delta_time: float) e
-            velocity_callback: Funzione che riceve (RobotState, delta_time: float) e
-                             ritorna velocità desiderate [rad/s] per i 7 giunti
-            duration: Durata del controllo in secondi
-
-        Returns:
-            True se il controllo è completato con successo
-        """
-        print(f"Avvio controllo velocità per {duration}s")
-
+        self.robot._ensure_can_command()
 
         try:
-            # Avvia il controllo di velocità dei giunti
+            self._validate_duration(duration)
+
+            print(f"Avvio controllo velocità per {duration}s")
+
+            self.robot.mode = self.robot.mode.__class__.RUNNING
+
             active_control = self.robot.robot.start_joint_velocity_control(
                 pylibfranka.ControllerMode.CartesianImpedance
             )
@@ -286,46 +397,61 @@ class MotionController:
             motion_finished = False
 
             while not motion_finished:
-                # Leggi stato del robot
                 robot_state, delta_time = active_control.readOnce()
-                
-                # Aggiorna tempo
-                time_elapsed += delta_time.to_sec()
 
-                # Chiama il callback dell'utente
-                dq = velocity_callback(robot_state, delta_time.to_sec())
+                dt = delta_time.to_sec()
+                time_elapsed += dt
 
-                # Crea comando di velocità
+                dq = velocity_callback(robot_state, dt)
+
+                self._validate_joint_vector(dq, "dq")
+
                 velocity_cmd = pylibfranka.JointVelocities(dq)
-                
-                # Verifica se abbiamo raggiunto il tempo massimo
+
                 if time_elapsed >= duration:
                     velocity_cmd.motion_finished = True
                     motion_finished = True
                 else:
                     velocity_cmd.motion_finished = False
 
-                # Invia comando al robot
                 active_control.writeOnce(velocity_cmd)
+
+            self.robot.mode = self.robot.mode.__class__.READY
 
             print("✓ Controllo velocità completato")
             return True
+
         except Exception as e:
-            print(f"✗ Errore durante controllo velocità: {e}")
+            error = self.robot._enter_error_locked(
+                operation="motion/velocity_control",
+                exception=e,
+                recoverable=True,
+            )
+
+            print(f"✗ Errore durante controllo velocità: {error.message}")
+            traceback.print_exc()
             return False
 
+    # ------------------------------------------------------------
+    # Home
+    # ------------------------------------------------------------
+
     def go_to_home(self, speed_factor: float = 0.2) -> bool:
-        """
-        Porta il robot alla configurazione home standard.
+        self.robot._ensure_can_command()
 
-        Args:
-            speed_factor: Fattore di velocità
-
-        Returns:
-            True se il movimento è completato con successo
-        """
-        # Configurazione home tipica per Franka Panda
-        home_position = [0, 0, 0, -3.03005749, 1.55690476, 1.56836934, -0.29296873]
+        home_position = [
+            0,
+            0,
+            0,
+            -3.03005749,
+            1.55690476,
+            1.56836934,
+            -0.29296873,
+        ]
 
         print("Ritorno alla posizione home...")
-        return self.move_to_joint_positions(home_position, speed_factor)
+
+        return self.move_to_joint_positions(
+            home_position,
+            speed_factor=speed_factor,
+        )

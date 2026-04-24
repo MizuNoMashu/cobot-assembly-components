@@ -1,9 +1,8 @@
 """
 Utility functions per il controller Franka
 """
-
 import numpy as np
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 def validate_joint_positions(positions: List[float], num_joints: int = 7) -> bool:
