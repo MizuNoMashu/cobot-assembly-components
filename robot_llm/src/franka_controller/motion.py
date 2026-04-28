@@ -3,6 +3,7 @@ Controller per il movimento del robot Franka usando pylibfranka.
 Fornisce interfacce ad alto livello per movimenti in spazio dei giunti e cartesiano.
 """
 
+from copy import error
 import traceback
 import numpy as np
 from typing import List, Optional, Callable
@@ -97,7 +98,6 @@ class MotionController:
                 robot_state, delta_time = active_control.readOnce()
                 cartesian_contact = np.array(robot_state.cartesian_contact, dtype=bool)
                 cartesian_collision = np.array(robot_state.cartesian_collision, dtype=bool)
-
                 if np.any(cartesian_collision):
                     hold_cmd = pylibfranka.JointPositions(list(robot_state.q))
                     hold_cmd.motion_finished = True
@@ -135,6 +135,7 @@ class MotionController:
                 print(f"[MOTION][LIVE] q_measured: {np.round(q_measured, 5).tolist()}")
                 print(f"[MOTION][LIVE] dq_measured: {np.round(measured_step, 5).tolist()}")
                 print(f"[MOTION][LIVE] q_command : {np.round(q_current, 5).tolist()}")
+                print(f"[MOTION][LIVE] Contact: {cartesian_contact.tolist()} | Collision: {cartesian_collision.tolist()}")
 
                 if progress >= 1.0:
                     joint_cmd.motion_finished = True
@@ -197,14 +198,47 @@ class MotionController:
 
             print("✓ Movimento completato con successo")
             return True
+        except pylibfranka.ControlException as e:
+            error = self.robot._enter_error_locked(
+                operation="motion/move_to_joint_positions (ControlException )",
+                exception=e,
+                recoverable=False,
+            )
+            print(f"✗ ControlException durante il movimento: {error.message}, {robot_state.last_motion_errors}")
+            print(f"✗ Dettagli collision/contact: Cartesian contact: {cartesian_contact.tolist()}, Cartesian collision: {cartesian_collision.tolist()}")
+            print(f"✗ Ultimo stato robot: q={np.round(robot_state.q, 3).tolist()}, dq={np.round(robot_state.dq, 3).tolist()}")
+            print(f"✗ Ultimo comando inviato: {np.round(q_current, 3).tolist()}")
+            print(f"✗ Tempo totale trascorso: {time_elapsed:.3f}s, Iterazioni: {iteration_count}")
 
+            print(f"Cart. Contact: {cartesian_contact.tolist()} | "
+                f"Cart. Collision: {cartesian_collision.tolist()} | "
+                )
+            print(f"robot_state: O_T_EE{robot_state.O_T_EE}, O_T_EE_d{robot_state.O_T_EE_d}, F_T_EE{robot_state.F_T_EE}, tau_J{robot_state.tau_J},"
+                      f" O_F_ext_hat_K {robot_state.O_F_ext_hat_K }, K_F_ext_hat_K {robot_state.K_F_ext_hat_K }"
+                      f'tau_ext_hat_filtered {robot_state.tau_ext_hat_filtered}"')
+            print(f"✗ Verifica se il robot ha rilevato errori di movimento: {robot_state.last_motion_errors}")
+            if "cartesian_reflex" in str(e):
+                print("✗ [SAFETY] Cartesian reflex detected: Means contact detected.")
+            traceback.print_exc()
+            return False
+       
+        except RuntimeError as e:
+            error = self.robot._enter_error_locked(
+                operation="motion/move_to_joint_positions (RuntimeError)",
+                exception=e,
+                recoverable=False,
+            )
+           
+            print(f"✗ Errore critico durante il movimento: {error.message}")
+            traceback.print_exc()
+            return False
         except Exception as e:
             error = self.robot._enter_error_locked(
-                operation="motion/move_to_joint_positions",
+                operation="motion/move_to_joint_positions (Exception)",
                 exception=e,
                 recoverable=True,
             )
-
+          
             print(f"✗ Errore durante il movimento: {error.message}")
             traceback.print_exc()
             return False
