@@ -1,0 +1,20 @@
+services:
+  cobot-api:
+    build: .
+    # network_mode: host è necessario per la comunicazione FCI con il robot Franka.
+    # Con questa modalità il container usa direttamente la rete dell'host,
+    # quindi la porta 5000 è già raggiungibile senza port mapping esplicito.
+    network_mode: host
+    environment:
+      - FRANKA_ROBOT_IP=${FRANKA_ROBOT_IP:-172.16.0.3}
+      - HOST=0.0.0.0
+      - PORT=5000
+    # Necessario per il real-time scheduling (kEnforce) di pylibfranka
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio: 99
+      memlock: -1
+    restart: unless-stopped
+    stdin_open: false
+    tty: false
