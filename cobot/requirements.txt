@@ -2,3 +2,4 @@ numpy>=1.20.0
 flask>=3.0.0
 flask-socketio>=5.3.0
 eventlet>=0.35.0
+flasgger>=0.9.5

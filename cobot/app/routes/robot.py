@@ -27,6 +27,18 @@ def _not_connected():
 
 @robot_bp.route("/robot/disconnect", methods=["POST"])
 def disconnect():
+    """Disconnect the robot.
+
+    Disconnects the current Franka robot session and releases the connection.
+    ---
+    tags:
+      - Robot
+    responses:
+      200:
+        description: Robot disconnected successfully.
+      409:
+        description: Robot is not connected or is busy.
+    """
     if not manager.is_connected:
         return jsonify({"error": "non connesso"}), 409
     if manager.is_busy:
@@ -45,6 +57,32 @@ def disconnect():
 
 @robot_bp.route("/robot/connect", methods=["POST"])
 def connect():
+    """Connect to a Franka robot.
+
+    The request body may contain `robot_ip` and `enforce_realtime`.
+    ---
+    tags:
+      - Robot
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            robot_ip:
+              type: string
+              example: 172.16.0.3
+            enforce_realtime:
+              type: boolean
+              example: true
+    responses:
+      200:
+        description: Robot connected.
+      409:
+        description: Already connected.
+      500:
+        description: Connection failed.
+    """
     if manager.is_connected:
         return jsonify({"error": "già connesso", "mode": manager.robot.mode.value}), 409
 
@@ -66,6 +104,27 @@ def connect():
 
 @robot_bp.route("/robot/config", methods=["GET"])
 def robot_config():
+    """Get robot configuration.
+
+    Returns the current robot IP and realtime enforcement settings.
+    ---
+    tags:
+      - Robot
+    responses:
+      200:
+        description: Robot configuration.
+        schema:
+          type: object
+          properties:
+            robot_ip:
+              type: string
+              example: 172.16.0.3
+            enforce_realtime:
+              type: boolean
+              example: true
+            fci_note:
+              type: string
+    """
     if manager.is_connected:
         ip = manager.robot.robot_ip
         enforce = manager.robot.enforce_realtime
@@ -86,6 +145,20 @@ def robot_config():
 
 @robot_bp.route("/robot/state", methods=["GET"])
 def robot_state():
+    """Get robot state.
+
+    Returns the current robot joint positions, velocities, and other state information.
+    ---
+    tags:
+      - Robot
+    responses:
+      200:
+        description: Robot state data.
+      503:
+        description: Robot not connected.
+      500:
+        description: Error reading robot state.
+    """
     if not manager.is_connected:
         return _not_connected()
     try:
@@ -96,11 +169,60 @@ def robot_state():
 
 @robot_bp.route("/robot/status", methods=["GET"])
 def robot_status():
+    """Get robot status.
+
+    Returns connection status and current operation state.
+    ---
+    tags:
+      - Robot
+    responses:
+      200:
+        description: Robot status.
+        schema:
+          type: object
+          properties:
+            connected:
+              type: boolean
+            busy:
+              type: boolean
+            mode:
+              type: string
+    """
     return jsonify(manager.status_dict()), 200
 
 
 @robot_bp.route("/robot/errors", methods=["GET"])
 def robot_errors():
+    """Get robot errors.
+
+    Returns a list of current robot errors.
+    ---
+    tags:
+      - Robot
+    responses:
+      200:
+        description: List of robot errors.
+        schema:
+          type: object
+          properties:
+            errors:
+              type: array
+              items:
+                type: object
+                properties:
+                  operation:
+                    type: string
+                  type:
+                    type: string
+                  message:
+                    type: string
+                  timestamp:
+                    type: string
+                  recoverable:
+                    type: boolean
+      503:
+        description: Robot not connected.
+    """
     if not manager.is_connected:
         return _not_connected()
     errors = [
@@ -118,6 +240,18 @@ def robot_errors():
 
 @robot_bp.route("/robot/errors", methods=["DELETE"])
 def clear_robot_errors():
+    """Clear robot errors.
+
+    Clears all current robot errors.
+    ---
+    tags:
+      - Robot
+    responses:
+      200:
+        description: Errors cleared.
+      503:
+        description: Robot not connected.
+    """
     if not manager.is_connected:
         return _not_connected()
     manager.robot.clear_errors()
@@ -126,6 +260,27 @@ def clear_robot_errors():
 
 @robot_bp.route("/robot/recovery", methods=["POST"])
 def recovery():
+    """Perform automatic error recovery.
+
+    Attempts to recover from robot errors automatically.
+    ---
+    tags:
+      - Robot
+    responses:
+      200:
+        description: Recovery attempt result.
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+            mode:
+              type: string
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
     if not manager.is_connected:
         return _not_connected()
     if manager.is_busy:
@@ -136,6 +291,44 @@ def recovery():
 
 @robot_bp.route("/robot/collision-behavior", methods=["POST"])
 def collision_behavior():
+    """Set collision behavior.
+
+    Configures collision detection thresholds for torque and force.
+    ---
+    tags:
+      - Robot
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            lower_torque:
+              type: array
+              items:
+                type: number
+            upper_torque:
+              type: array
+              items:
+                type: number
+            lower_force:
+              type: array
+              items:
+                type: number
+            upper_force:
+              type: array
+              items:
+                type: number
+    responses:
+      200:
+        description: Collision behavior set.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+      500:
+        description: Error setting collision behavior.
+    """
     if not manager.is_connected:
         return _not_connected()
     if manager.is_busy:
@@ -160,6 +353,29 @@ def collision_behavior():
 
 @robot_bp.route("/motion/move-home", methods=["POST"])
 def move_home():
+    """Move robot to home position.
+
+    Moves the robot to its predefined home joint positions.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            speed_factor:
+              type: number
+              example: 0.2
+    responses:
+      202:
+        description: Motion accepted.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
     if not manager.is_connected:
         return _not_connected()
     if manager.is_busy:
@@ -176,6 +392,41 @@ def move_home():
 
 @robot_bp.route("/motion/move-joints", methods=["POST"])
 def move_joints():
+    """Move to joint positions.
+
+    Moves the robot to specified joint positions.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            positions:
+              type: array
+              items:
+                type: number
+              minItems: 7
+              maxItems: 7
+            speed_factor:
+              type: number
+              example: 0.2
+            tolerance:
+              type: number
+              example: 0.04
+    responses:
+      202:
+        description: Motion accepted.
+      400:
+        description: Invalid positions.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
     if not manager.is_connected:
         return _not_connected()
     if manager.is_busy:
@@ -202,6 +453,38 @@ def move_joints():
 
 @robot_bp.route("/motion/move-relative", methods=["POST"])
 def move_relative():
+    """Move relative to current position.
+
+    Moves the robot by relative joint deltas from current position.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            deltas:
+              type: array
+              items:
+                type: number
+              minItems: 7
+              maxItems: 7
+            speed_factor:
+              type: number
+              example: 0.2
+    responses:
+      202:
+        description: Motion accepted.
+      400:
+        description: Invalid deltas.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
     if not manager.is_connected:
         return _not_connected()
     if manager.is_busy:

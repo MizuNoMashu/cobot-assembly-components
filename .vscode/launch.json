@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Debug Flask Cobot Server",
+      "type": "python",
+      "request": "launch",
+      "module": "app.server",
+      "python": "${workspaceFolder}/cobot/venv/bin/python",
+      "cwd": "${workspaceFolder}/cobot",
+      "justMyCode": true,
+      "env": {
+        "FLASK_ENV": "development",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "args": []
+    }
+  ]
+}

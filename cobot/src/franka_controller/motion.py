@@ -69,6 +69,8 @@ class MotionController:
             print(f"[MOTION] Posizione iniziale: {np.round(q_start, 3).tolist()}")
 
             self.robot.mode = self.robot.mode.__class__.RUNNING
+            active_control = None
+            q_last: Optional[np.ndarray] = None
 
             print("[MOTION] Avviando controllo posizione giunti...")
             active_control = self.robot.robot.start_joint_position_control(
@@ -118,13 +120,7 @@ class MotionController:
                 progress_pct = progress * 100.0
                 max_delta_cmd = float(np.max(np.abs(target - q_current)))
 
-                print(
-                    f"[MOTION][LIVE] Iter {iteration_count:4d} | "
-                    f"Progress: {progress_pct:6.2f}% | "
-                    f"Tempo: {time_elapsed:7.4f}s | "
-                    f"dT: {delta_time.to_sec():.4f}s | "
-                    f"Max delta cmd: {max_delta_cmd:.6f} rad"
-                )
+ 
                 print(f"[MOTION][LIVE] q_measured: {np.round(q_measured, 5).tolist()}")
                 print(f"[MOTION][LIVE] dq_measured: {np.round(measured_step, 5).tolist()}")
                 print(f"[MOTION][LIVE] q_command : {np.round(q_current, 5).tolist()}")
@@ -165,8 +161,6 @@ class MotionController:
 
                 active_control.writeOnce(joint_cmd)
 
-            for log_line in monitoring_log:
-                print(log_line)
 
             final_state = self.robot.get_state()
             q_final_real = np.array(final_state.q)
@@ -217,6 +211,21 @@ class MotionController:
             print(f"✗ Errore durante il movimento: {error.message}")
             traceback.print_exc()
             return False
+
+        finally:
+            if active_control is not None:
+                try:
+                    if q_last is None:
+                        q_last = np.array(self.robot.get_state().q)
+                    hold_cmd = pylibfranka.JointPositions(q_last.tolist())
+                    hold_cmd.motion_finished = True
+                    active_control.writeOnce(hold_cmd)
+                except Exception as cleanup_exc:
+                    print(f"[MOTION] Cleanup active control failed: {cleanup_exc}")
+                try:
+                    self.robot.robot.stop()
+                except Exception as cleanup_exc:
+                    print(f"[MOTION] Robot.stop() failed during cleanup: {cleanup_exc}")
 
     # ------------------------------------------------------------
     # Relative joint motion
@@ -316,6 +325,9 @@ class MotionController:
     ) -> bool:
         self.robot._ensure_can_command()
 
+        active_control = None
+        q_last: Optional[np.ndarray] = None
+
         try:
             self._validate_duration(duration)
             print(f"Avvio controllo velocità per {duration}s")
@@ -332,6 +344,7 @@ class MotionController:
             while not motion_finished:
                 iteration_count += 1
                 robot_state, delta_time = active_control.readOnce()
+                q_last = np.array(robot_state.q)
                 dt = delta_time.to_sec()
                 time_elapsed += dt
 
@@ -372,6 +385,21 @@ class MotionController:
             print(f"✗ Errore durante controllo velocità: {error.message}")
             traceback.print_exc()
             return False
+
+        finally:
+            if active_control is not None:
+                try:
+                    if q_last is None:
+                        q_last = np.array(self.robot.get_state().q)
+                    stop_cmd = pylibfranka.JointVelocities([0.0] * 7)
+                    stop_cmd.motion_finished = True
+                    active_control.writeOnce(stop_cmd)
+                except Exception as cleanup_exc:
+                    print(f"[MOTION] Cleanup velocity control failed: {cleanup_exc}")
+                try:
+                    self.robot.robot.stop()
+                except Exception as cleanup_exc:
+                    print(f"[MOTION] Robot.stop() failed during velocity cleanup: {cleanup_exc}")
 
     # ------------------------------------------------------------
     # Home

@@ -6,7 +6,9 @@ movimento vengono eseguite in un thread di background; il WebSocket riceve
 la telemetria live via progress_callback.
 """
 
+import inspect
 import threading
+import traceback
 from typing import Optional, Callable, Any
 
 from franka_controller import FrankaRobot
@@ -90,18 +92,30 @@ class RobotManager:
         Prova ad acquisire il lock e lancia func in un thread di background.
 
         Ritorna True se il thread è stato avviato, False se il robot è occupato.
-        Inietta sempre progress_callback=self._progress_callback se func lo accetta.
+        Inietta progress_callback=self._progress_callback solo se il target lo supporta.
         """
         if not self._operation_lock.acquire(blocking=False):
             return False
 
+        signature = inspect.signature(func)
+        injected_kwargs = dict(kwargs)
+        if "progress_callback" in signature.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()
+        ):
+            injected_kwargs["progress_callback"] = self._progress_callback
+
         def _run():
             try:
-                kwargs["progress_callback"] = self._progress_callback
-                result = func(*args, **kwargs)
+                print(
+                    f"[RobotManager] Async task started: {func.__name__} args={args} "
+                    f"kwargs={list(injected_kwargs.keys())}"
+                )
+                result = func(*args, **injected_kwargs)
                 self._emit(on_complete_event, {"success": bool(result)})
             except Exception as exc:
-                self._emit("motion_error", {"error": str(exc)})
+                error_info = traceback.format_exc()
+                print(f"[RobotManager] Async task failed: {exc!r}\n{error_info}")
+                self._emit("motion_error", {"error": str(exc), "traceback": error_info})
             finally:
                 self._cached_state = {}
                 self._operation_lock.release()

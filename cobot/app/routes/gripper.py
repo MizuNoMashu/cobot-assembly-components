@@ -33,6 +33,33 @@ def _gripper():
 
 @gripper_bp.route("/state", methods=["GET"])
 def gripper_state():
+    """Get gripper state.
+
+    Returns the current gripper width, max width, grasp status, and temperature.
+    ---
+    tags:
+      - Gripper
+    responses:
+      200:
+        description: Gripper state.
+        schema:
+          type: object
+          properties:
+            mode:
+              type: string
+            width_mm:
+              type: number
+            max_width_mm:
+              type: number
+            is_grasped:
+              type: boolean
+            temperature:
+              type: number
+      500:
+        description: Error reading gripper state.
+      503:
+        description: Robot not connected.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -50,6 +77,36 @@ def gripper_state():
 
 @gripper_bp.route("/errors", methods=["GET"])
 def gripper_errors():
+    """Get gripper errors.
+
+    Returns a list of current gripper errors.
+    ---
+    tags:
+      - Gripper
+    responses:
+      200:
+        description: List of gripper errors.
+        schema:
+          type: object
+          properties:
+            errors:
+              type: array
+              items:
+                type: object
+                properties:
+                  operation:
+                    type: string
+                  type:
+                    type: string
+                  message:
+                    type: string
+                  timestamp:
+                    type: string
+                  recoverable:
+                    type: boolean
+      503:
+        description: Robot not connected.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -68,6 +125,18 @@ def gripper_errors():
 
 @gripper_bp.route("/errors", methods=["DELETE"])
 def clear_gripper_errors():
+    """Clear gripper errors.
+
+    Clears all current gripper errors.
+    ---
+    tags:
+      - Gripper
+    responses:
+      200:
+        description: Errors cleared.
+      503:
+        description: Robot not connected.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -81,6 +150,20 @@ def clear_gripper_errors():
 
 @gripper_bp.route("/home", methods=["POST"])
 def gripper_home():
+    """Home the gripper.
+
+    Performs gripper homing calibration.
+    ---
+    tags:
+      - Gripper
+    responses:
+      202:
+        description: Homing accepted.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -96,6 +179,39 @@ def gripper_home():
 
 @gripper_bp.route("/open", methods=["POST"])
 def gripper_open():
+    """Open the gripper.
+
+    Opens the gripper to the specified width.
+    ---
+    tags:
+      - Gripper
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            width_mm:
+              type: number
+              example: 80.0
+            speed:
+              type: number
+              example: 0.1
+    responses:
+      200:
+        description: Gripper opened.
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+      500:
+        description: Error opening gripper.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -115,6 +231,36 @@ def gripper_open():
 
 @gripper_bp.route("/close", methods=["POST"])
 def gripper_close():
+    """Close the gripper.
+
+    Closes the gripper at the specified speed.
+    ---
+    tags:
+      - Gripper
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            speed:
+              type: number
+              example: 0.1
+    responses:
+      200:
+        description: Gripper closed.
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+      500:
+        description: Error closing gripper.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -133,6 +279,51 @@ def gripper_close():
 
 @gripper_bp.route("/grasp", methods=["POST"])
 def gripper_grasp():
+    """Grasp with the gripper.
+
+    Attempts to grasp an object at the specified width and force.
+    ---
+    tags:
+      - Gripper
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            width_mm:
+              type: number
+              example: 30.0
+            force:
+              type: number
+              example: 60.0
+            speed:
+              type: number
+              example: 0.1
+            epsilon_inner:
+              type: number
+              example: 0.005
+            epsilon_outer:
+              type: number
+              example: 0.005
+    responses:
+      200:
+        description: Grasp attempt result.
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+      400:
+        description: Missing width_mm parameter.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+      500:
+        description: Error during grasp.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -164,6 +355,36 @@ def gripper_grasp():
 
 @gripper_bp.route("/release", methods=["POST"])
 def gripper_release():
+    """Release the gripper.
+
+    Releases any grasped object.
+    ---
+    tags:
+      - Gripper
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            speed:
+              type: number
+              example: 0.1
+    responses:
+      200:
+        description: Gripper released.
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+      500:
+        description: Error releasing gripper.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -182,6 +403,25 @@ def gripper_release():
 
 @gripper_bp.route("/stop", methods=["POST"])
 def gripper_stop():
+    """Stop the gripper.
+
+    Immediately stops any ongoing gripper operation.
+    ---
+    tags:
+      - Gripper
+    responses:
+      200:
+        description: Gripper stopped.
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+      503:
+        description: Robot not connected.
+      500:
+        description: Error stopping gripper.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -194,6 +434,27 @@ def gripper_stop():
 
 @gripper_bp.route("/reset-lock", methods=["POST"])
 def gripper_reset_lock():
+    """Reset gripper error lock.
+
+    Resets the gripper error lock state.
+    ---
+    tags:
+      - Gripper
+    responses:
+      200:
+        description: Error lock reset.
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+            mode:
+              type: string
+      503:
+        description: Robot not connected.
+      500:
+        description: Error resetting lock.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
@@ -206,6 +467,29 @@ def gripper_reset_lock():
 
 @gripper_bp.route("/reconnect", methods=["POST"])
 def gripper_reconnect():
+    """Reconnect the gripper.
+
+    Attempts to reconnect to the gripper.
+    ---
+    tags:
+      - Gripper
+    responses:
+      200:
+        description: Gripper reconnected.
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+            mode:
+              type: string
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+      500:
+        description: Error reconnecting gripper.
+    """
     g = _gripper()
     if g is None:
         return _not_connected()
