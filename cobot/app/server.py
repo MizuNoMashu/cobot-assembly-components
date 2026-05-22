@@ -19,6 +19,7 @@ from flasgger import Swagger
 from app.robot_manager import RobotManager
 from app.routes.robot import robot_bp
 from app.routes.gripper import gripper_bp
+from app.routes.desk_api import desk_bp
 
 # ------------------------------------------------------------------
 # App setup
@@ -122,6 +123,7 @@ manager.set_socketio(socketio)
 
 app.register_blueprint(robot_bp)
 app.register_blueprint(gripper_bp)
+app.register_blueprint(desk_bp)
 
 # ------------------------------------------------------------------
 # Health check
