@@ -13,6 +13,7 @@ from requests.auth import HTTPBasicAuth
 # Enums
 # ------------------------------------------------------------------
 
+
 class DeskSystemStatus(Enum):
     STARTING = "Starting"
     FIRST_START = "FirstStart"
@@ -53,6 +54,7 @@ class DeskErrorType(Enum):
 # Dataclasses
 # ------------------------------------------------------------------
 
+
 @dataclass
 class DeskError:
     operation: str
@@ -76,6 +78,7 @@ class ControlToken:
 # ------------------------------------------------------------------
 # Main class
 # ------------------------------------------------------------------
+
 
 class FrankaDeskAPI:
     """
@@ -117,7 +120,7 @@ class FrankaDeskAPI:
         self.base_url = f"{self.scheme}://{self.robot_ip}"
 
         self.session = requests.Session()
-        #self.session.auth = HTTPBasicAuth(self.username, self.password)
+        self.session.auth = HTTPBasicAuth(self.username, self.password)
 
         self.control_token: Optional[ControlToken] = None
 
@@ -223,6 +226,7 @@ class FrankaDeskAPI:
         data: Optional[Any] = None,
         extra_headers: Optional[Dict[str, str]] = None,
         expected_status: Optional[List[int]] = None,
+        http_timeout: Optional[float] = None,
     ) -> Optional[Any]:
 
         if expected_status is None:
@@ -238,7 +242,7 @@ class FrankaDeskAPI:
                 ),
                 json=json,
                 data=data,
-                timeout=self.timeout,
+                timeout=http_timeout if http_timeout is not None else self.timeout,
                 verify=self.verify_ssl,
             )
 
@@ -321,14 +325,16 @@ class FrankaDeskAPI:
             operation="get_operating_mode",
         )
 
-        value = state.get("status", "Unknown")
+        value = (
+            state.get("mode")
+            or state.get("operatingMode")
+            or state.get("status", "Unknown")
+        )
 
         try:
             return DeskOperatingMode(value)
         except ValueError:
             return DeskOperatingMode.UNKNOWN
-
-    def change_to_execution_mode(self) -> None:
         self._request(
             method="POST",
             path="/api/system/operating-mode:change",
@@ -374,7 +380,7 @@ class FrankaDeskAPI:
 
     def take_control_token(
         self,
-        timeout: Optional[float] = 1.0,
+        timeout: Optional[float] = 10.0,
     ) -> ControlToken:
 
         body = {
@@ -382,18 +388,21 @@ class FrankaDeskAPI:
         }
 
         if timeout is not None:
-            body["timeout"] = timeout
+            body["timeout"] = int(timeout)
+
+        http_timeout = (timeout + 5.0) if timeout is not None else self.timeout
 
         response = self._request(
             method="POST",
             path="/api/system/control-token:take",
             operation="take_control_token",
             json=body,
+            http_timeout=http_timeout,
         )
 
         self.control_token = ControlToken(
             token=response["token"],
-            token_id=response.get("tokenId"),
+            token_id=response.get("token_id") or response.get("tokenId"),
             owner=self.owner,
             timestamp=datetime.now(),
         )
@@ -458,16 +467,14 @@ class FrankaDeskAPI:
             method="POST",
             path="/api/arm/joints:lock",
             operation="lock_joints",
+            require_token=True,
             expected_status=[204],
         )
 
     def are_joints_unlocked(self) -> bool:
         joints = self.get_joints()
 
-        return all(
-            joint.get("brakeStatus") == "Unlocked"
-            for joint in joints
-        )
+        return all(joint.get("brakeStatus") == "Unlocked" for joint in joints)
 
     # ------------------------------------------------------------
     # FCI
@@ -604,9 +611,7 @@ class FrankaDeskAPI:
         report["recovery"] = recovery
 
         if recovery.get("recovery") is not None:
-            raise RuntimeError(
-                f"Recovery safety attiva: {recovery['recovery']}"
-            )
+            raise RuntimeError(f"Recovery safety attiva: {recovery['recovery']}")
 
         operating_mode = self.get_operating_mode()
         report["operating_mode"] = operating_mode.value
@@ -648,10 +653,7 @@ class FrankaDeskAPI:
             joints = self.get_joints()
             print("Joints:")
             for joint in joints:
-                print(
-                    f"  Joint {joint.get('joint')}: "
-                    f"{joint.get('brakeStatus')}"
-                )
+                print(f"  Joint {joint.get('joint')}: {joint.get('brakeStatus')}")
         except Exception as e:
             print(f"Errore lettura joints: {e}")
 
