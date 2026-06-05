@@ -107,7 +107,7 @@ class FrankaDeskAPI:
         owner: str = "franka-backend",
         timeout: float = 5.0,
         verify_ssl: bool = False,
-        scheme: str = "https",
+        scheme: str = "https",  # ← Torna a HTTPS (il robot redirige comunque)
     ):
         self.robot_ip = robot_ip or os.getenv("FRANKA_ROBOT_IP", "172.16.0.3")
         self.username = username or os.getenv("FRANKA_USERNAME", "fixed_arm")
@@ -121,6 +121,8 @@ class FrankaDeskAPI:
 
         self.session = requests.Session()
         self.session.auth = HTTPBasicAuth(self.username, self.password)
+        self.session.verify = self.verify_ssl  # Disabilita SSL warnings
+        self.session.allow_redirects = False  # ← ADDED: Non seguire redirect per i POST
 
         self.control_token: Optional[ControlToken] = None
 
@@ -144,6 +146,7 @@ class FrankaDeskAPI:
 
         headers = {
             "Accept": "application/json",
+            "Content-Type": "application/json",  # ← ADDED: Franka richiede questo header
         }
 
         if require_token:
@@ -233,13 +236,16 @@ class FrankaDeskAPI:
             expected_status = [200, 204]
 
         try:
+            url = self._url(path)
+            headers = self._headers(
+                require_token=require_token,
+                extra_headers=extra_headers,
+            )
+            
             response = self.session.request(
                 method=method.upper(),
-                url=self._url(path),
-                headers=self._headers(
-                    require_token=require_token,
-                    extra_headers=extra_headers,
-                ),
+                url=url,
+                headers=headers,
                 json=json,
                 data=data,
                 timeout=http_timeout if http_timeout is not None else self.timeout,
@@ -391,22 +397,45 @@ class FrankaDeskAPI:
             body["timeout"] = int(timeout)
 
         http_timeout = (timeout + 5.0) if timeout is not None else self.timeout
+        last_error = None
+        
+        for path in [ "/api/system/control-token:take", "/api/system/control-token:take?force=true" ]:
+            try:
+                response = self._request(
+                    method="POST",
+                    path=path,
+                    operation="take_control_token",
+                    json=body,
+                    http_timeout=http_timeout,
+                )
 
-        response = self._request(
-            method="POST",
-            path="/api/system/control-token:take",
-            operation="take_control_token",
-            json=body,
-            http_timeout=http_timeout,
-        )
-
-        self.control_token = ControlToken(
-            token=response["token"],
-            token_id=response.get("token_id") or response.get("tokenId"),
-            owner=self.owner,
-            timestamp=datetime.now(),
-        )
-
+                self.control_token = ControlToken(
+                    token=response["token"],
+                    token_id=response.get("tokenId"),
+                    owner=self.owner,
+                    timestamp=datetime.now(),
+                )
+                return self.control_token  # ✅ SUCCESS - exit immediately
+                
+            except Exception as e:
+                error_str = str(e)
+                # Ritenta con force flag se il token è in uso o c'è un timeout
+                if "control_token_error" in error_str or "failed_dependency_error" in error_str:
+                    if "force" not in path:  # Solo se non abbiamo già usato force
+                        print(f"Token occupato o timeout, ritento con force flag... ({e})")
+                        last_error = e
+                        continue  # Retry with next path (force flag)
+                    else:
+                        # Abbiamo già tentato con force, fallisce comunque
+                        raise
+                else:
+                    # Different error, propagate immediately
+                    raise
+        
+        # If both attempts failed
+        if last_error:
+            raise last_error
+        
         return self.control_token
 
     def release_control_token(self) -> None:
