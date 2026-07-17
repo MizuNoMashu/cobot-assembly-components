@@ -147,11 +147,21 @@ class RobotManager:
             state = self.robot.get_state()
             pose = self.robot.get_current_cartesian_pose()
             pos = pose[:3, 3]
+            orientation = pose[:3, :3]
             return {
                 "mode": self.robot.mode.value,
                 "joint_positions": list(state.q),
                 "joint_velocities": list(state.dq),
-                "cartesian_position": {"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])},
+                "cartesian_pose": {
+                    "position": {
+                        "x": float(pos[0]),
+                        "y": float(pos[1]),
+                        "z": float(pos[2]),
+                    },
+                    "orientation": {
+                        "matrix": orientation.tolist(),
+                    },
+                },
                 "external_forces": list(self.robot.get_external_forces()),
                 "cartesian_contact": list(self.robot.get_cartesian_contact()),
                 "cartesian_collision": list(self.robot.get_cartesian_collision()),

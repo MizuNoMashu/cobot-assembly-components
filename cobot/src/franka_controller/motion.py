@@ -2,12 +2,113 @@
 Controller per il movimento del robot Franka usando pylibfranka.
 """
 
-from copy import error
 import traceback
 import numpy as np
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Tuple
 
 import pylibfranka
+
+
+def _rpy_to_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    Rx = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, np.cos(roll), -np.sin(roll)],
+        [0.0, np.sin(roll), np.cos(roll)],
+    ])
+    Ry = np.array([
+        [np.cos(pitch), 0.0, np.sin(pitch)],
+        [0.0, 1.0, 0.0],
+        [-np.sin(pitch), 0.0, np.cos(pitch)],
+    ])
+    Rz = np.array([
+        [np.cos(yaw), -np.sin(yaw), 0.0],
+        [np.sin(yaw), np.cos(yaw), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    return Rz @ Ry @ Rx
+
+
+def _rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
+    trace = np.trace(R)
+    if trace > 0.0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    else:
+        if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+    quat = np.array([w, x, y, z], dtype=float)
+    return quat / np.linalg.norm(quat)
+
+
+def _quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
+    q = q / np.linalg.norm(q)
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y**2 + z**2), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x**2 + z**2), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x**2 + y**2)],
+    ], dtype=float)
+
+
+def _slerp_quaternion(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+    dot = np.dot(q0, q1)
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        result = q0 + t * (q1 - q0)
+        return result / np.linalg.norm(result)
+    theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
+    sin_theta_0 = np.sin(theta_0)
+    theta = theta_0 * t
+    sin_theta = np.sin(theta)
+    s0 = np.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+    return (s0 * q0) + (s1 * q1)
+
+
+def _rotation_matrix_to_rpy(R: np.ndarray) -> Tuple[float, float, float]:
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        roll = np.arctan2(R[2, 1], R[2, 2])
+        pitch = np.arctan2(-R[2, 0], sy)
+        yaw = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        roll = np.arctan2(-R[1, 2], R[1, 1])
+        pitch = np.arctan2(-R[2, 0], sy)
+        yaw = 0.0
+    return roll, pitch, yaw
+
+
+def _build_cartesian_pose(x: float, y: float, z: float, roll: float, pitch: float, yaw: float) -> np.ndarray:
+    pose = np.eye(4, dtype=float)
+    pose[:3, :3] = _rpy_to_rotation_matrix(roll, pitch, yaw)
+    pose[:3, 3] = [x, y, z]
+    return pose
+
+
+def _pose_to_cartesian_command(pose: np.ndarray) -> pylibfranka.CartesianPose:
+    return pylibfranka.CartesianPose(pose.reshape(-1, order="F").tolist())
 
 
 class MotionController:
@@ -313,13 +414,205 @@ class MotionController:
     # Cartesian placeholder
     # ------------------------------------------------------------
 
-    def move_to_cartesian_pose(self, x, y, z, roll=0.0, pitch=0.0, yaw=0.0, speed_factor=0.2):
-        self.robot._ensure_can_command()
-        raise NotImplementedError("Movimento cartesiano non implementato: serve inverse kinematics.")
+    def move_to_cartesian_pose(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        roll: float = 0.0,
+        pitch: float = 0.0,
+        yaw: float = 0.0,
+        speed_factor: float = 0.2,
+        tolerance: float = 0.01,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+    ) -> bool:
+        """
+        Muove l'end-effector verso una posa cartesiana target.
 
-    def move_cartesian_relative(self, dx=0.0, dy=0.0, dz=0.0, droll=0.0, dpitch=0.0, dyaw=0.0, speed_factor=0.2):
+        Il target è espresso come posizione + orientamento RPY.
+        """
         self.robot._ensure_can_command()
-        raise NotImplementedError("Movimento cartesiano non implementato: serve inverse kinematics.")
+
+        try:
+            self._validate_speed_factor(speed_factor)
+
+            target_pose = _build_cartesian_pose(x, y, z, roll, pitch, yaw)
+            current_pose = self.robot.get_current_cartesian_pose()
+            current_rot = current_pose[:3, :3]
+            current_quat = _rotation_matrix_to_quaternion(current_rot)
+            target_quat = _rotation_matrix_to_quaternion(target_pose[:3, :3])
+
+            print(f"[MOTION] Movimento cartesiano verso posa target: {[x, y, z, roll, pitch, yaw]}")
+            print(f"[MOTION] Speed factor: {speed_factor}, Tolerance: {tolerance}")
+            print("[MOTION] Posa iniziale:")
+            print(current_pose)
+
+            self.robot.mode = self.robot.mode.__class__.RUNNING
+            active_control = self.robot.robot.start_cartesian_pose_control(
+                pylibfranka.ControllerMode.CartesianImpedance
+            )
+            print("[MOTION] ✓ Controllo cartesiano avviato")
+
+            duration = 5.0 / speed_factor
+            time_elapsed = 0.0
+            motion_finished = False
+            iteration_count = 0
+            pose_last: Optional[np.ndarray] = None
+
+            while not motion_finished:
+                iteration_count += 1
+                robot_state, delta_time = active_control.readOnce()
+                time_elapsed += delta_time.to_sec()
+                progress = min(time_elapsed / duration, 1.0)
+                s = compute_minimum_jerk_trajectory(progress)
+
+                position_command = current_pose[:3, 3] + (target_pose[:3, 3] - current_pose[:3, 3]) * s
+                interp_quat = _slerp_quaternion(current_quat, target_quat, s)
+                rotation_command = _quaternion_to_rotation_matrix(interp_quat)
+
+                pose_command = np.eye(4, dtype=float)
+                pose_command[:3, :3] = rotation_command
+                pose_command[:3, 3] = position_command
+
+                cartesian_cmd = _pose_to_cartesian_command(pose_command)
+                cartesian_cmd.motion_finished = progress >= 1.0
+
+                robot_pose = np.array(robot_state.O_T_EE).reshape(4, 4, order="F")
+                q_measured = np.array(robot_state.q)
+                position_error = np.linalg.norm(target_pose[:3, 3] - robot_pose[:3, 3])
+                orientation_error = np.arccos(
+                    np.clip(
+                        np.dot(
+                            _rotation_matrix_to_quaternion(robot_pose[:3, :3]),
+                            target_quat,
+                        ),
+                        -1.0,
+                        1.0,
+                    )
+                )
+
+                if progress_callback is not None:
+                    progress_callback({
+                        "type": "cartesian_progress",
+                        "iteration": iteration_count,
+                        "progress": round(progress * 100.0, 2),
+                        "time_elapsed": round(time_elapsed, 4),
+                        "pose_command": pose_command.tolist(),
+                        "pose_measured": robot_pose.tolist(),
+                        "position_error": round(float(position_error), 6),
+                        "orientation_error": round(float(orientation_error), 6),
+                    })
+
+                if np.any(np.array(robot_state.cartesian_collision, dtype=bool)):
+                    hold_cmd = _pose_to_cartesian_command(robot_pose)
+                    hold_cmd.motion_finished = True
+                    active_control.writeOnce(hold_cmd)
+                    raise RuntimeError("Collisione cartesiana rilevata: movimento interrotto.")
+
+                if np.any(np.array(robot_state.cartesian_contact, dtype=bool)):
+                    hold_cmd = _pose_to_cartesian_command(robot_pose)
+                    hold_cmd.motion_finished = True
+                    active_control.writeOnce(hold_cmd)
+                    raise RuntimeError("Contatto cartesiano rilevato: movimento interrotto.")
+
+                if progress >= 1.0:
+                    motion_finished = True
+                    pose_last = robot_pose
+                else:
+                    pose_last = robot_pose
+
+                active_control.writeOnce(cartesian_cmd)
+
+            final_pose = self.robot.get_current_cartesian_pose()
+            position_error = np.linalg.norm(target_pose[:3, 3] - final_pose[:3, 3])
+            if position_error > tolerance:
+                raise RuntimeError(
+                    f"Tolleranza non rispettata: errore posizione={position_error:.6f} m, "
+                    f"tolleranza={tolerance:.6f} m."
+                )
+
+            self.robot.mode = self.robot.mode.__class__.READY
+            print("✓ Movimento cartesiano completato con successo")
+            return True
+
+        except pylibfranka.ControlException as e:
+            error = self.robot._enter_error_locked(
+                operation="motion/move_to_cartesian_pose (ControlException)",
+                exception=e,
+                recoverable=False,
+            )
+            print(f"✗ ControlException durante il movimento cartesiano: {error.message}")
+            traceback.print_exc()
+            return False
+
+        except RuntimeError as e:
+            error = self.robot._enter_error_locked(
+                operation="motion/move_to_cartesian_pose (RuntimeError)",
+                exception=e,
+                recoverable=False,
+            )
+            print(f"✗ Errore critico durante il movimento cartesiano: {error.message}")
+            traceback.print_exc()
+            return False
+
+        except Exception as e:
+            error = self.robot._enter_error_locked(
+                operation="motion/move_to_cartesian_pose (Exception)",
+                exception=e,
+                recoverable=True,
+            )
+            print(f"✗ Errore durante il movimento cartesiano: {error.message}")
+            traceback.print_exc()
+            return False
+
+        finally:
+            if 'active_control' in locals() and active_control is not None:
+                try:
+                    final_pose = pose_last if pose_last is not None else self.robot.get_current_cartesian_pose()
+                    hold_cmd = _pose_to_cartesian_command(final_pose)
+                    hold_cmd.motion_finished = True
+                    active_control.writeOnce(hold_cmd)
+                except Exception as cleanup_exc:
+                    print(f"[MOTION] Cleanup active control failed: {cleanup_exc}")
+                try:
+                    self.robot.robot.stop()
+                except Exception as cleanup_exc:
+                    print(f"[MOTION] Robot.stop() failed during cleanup: {cleanup_exc}")
+
+    def move_cartesian_relative(
+        self,
+        dx: float = 0.0,
+        dy: float = 0.0,
+        dz: float = 0.0,
+        droll: float = 0.0,
+        dpitch: float = 0.0,
+        dyaw: float = 0.0,
+        speed_factor: float = 0.2,
+        tolerance: float = 0.01,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+    ) -> bool:
+        self.robot._ensure_can_command()
+
+        current_pose = self.robot.get_current_cartesian_pose()
+        relative_transform = np.eye(4, dtype=float)
+        relative_transform[:3, :3] = _rpy_to_rotation_matrix(droll, dpitch, dyaw)
+        relative_transform[:3, 3] = [dx, dy, dz]
+
+        target_pose = current_pose @ relative_transform
+        target_roll, target_pitch, target_yaw = _rotation_matrix_to_rpy(target_pose[:3, :3])
+        target_position = target_pose[:3, 3]
+
+        return self.move_to_cartesian_pose(
+            float(target_position[0]),
+            float(target_position[1]),
+            float(target_position[2]),
+            target_roll,
+            target_pitch,
+            target_yaw,
+            speed_factor=speed_factor,
+            tolerance=tolerance,
+            progress_callback=progress_callback,
+        )
 
     # ------------------------------------------------------------
     # Impedance control
