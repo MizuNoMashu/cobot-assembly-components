@@ -15,6 +15,10 @@ Servono per gestire:
 La Desk API è l'API HTTP del robot Franka.
 """
 
+from time import sleep
+from asyncio import sleep
+import traceback
+
 from flask import Blueprint, request, jsonify
 
 from app.robot_manager import RobotManager
@@ -93,24 +97,24 @@ def desk_connect():
               example: "franka-backend"
             timeout:
               type: number
-              example: 5.0
+              example: 15.0
             scheme:
               type: string
-              example: "http"
+              example: "https"
     responses:
       200:
         description: Desk API connected successfully.
       500:
         description: Desk API connection failed.
     """
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or request.values.to_dict(flat=True) or {}
 
     robot_ip = body.get("robot_ip", "172.16.0.3")
     username = body.get("username")
     password = body.get("password")
     owner = body.get("owner", "franka-backend")
-    timeout = float(body.get("timeout", 5.0))
-    scheme = body.get("scheme", "http")
+    timeout = float(body.get("timeout", 10.0))
+    scheme = body.get("scheme", "https")
 
     try:
         manager.desk = FrankaDeskAPI(
@@ -123,10 +127,12 @@ def desk_connect():
         )
 
         system_state = manager.desk.get_system_state()
+        print(f"Desk API connected to {robot_ip}, system status: {system_state.get('status')}")
 
         return jsonify({
             "status": "connected",
             "robot_ip": robot_ip,
+            "base_url": manager.desk.base_url,
             "system": system_state,
         }), 200
 
@@ -474,7 +480,7 @@ def desk_take_control_token():
           properties:
             timeout:
               type: number
-              example: 1.0
+              example: 10.0
     responses:
       200:
         description: Control token acquired.
@@ -488,8 +494,11 @@ def desk_take_control_token():
     if desk is None:
         return _desk_not_connected()
 
-    body = request.get_json(silent=True) or {}
-    timeout = body.get("timeout", 1.0)
+    body = request.get_json(silent=True)
+    if body is None:
+        body = request.values.to_dict(flat=True)
+
+    timeout = float(body.get("timeout", 10.0))
 
     try:
         token = desk.take_control_token(timeout=timeout)
@@ -503,7 +512,12 @@ def desk_take_control_token():
         }), 200
 
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        errors = [_serialize_desk_error(e) for e in desk.errors[-1:]] if desk.errors else []
+        return jsonify({
+            "error": str(exc),
+            "has_token": False,
+            "desk_errors": errors,
+        }), 500
 
 
 @desk_bp.route("/control-token/release", methods=["POST"])
@@ -526,6 +540,13 @@ def desk_release_control_token():
 
     if desk is None:
         return _desk_not_connected()
+
+    if desk.control_token is None:
+        return jsonify({
+            "error": "Nessun token di controllo SPoC acquisito",
+            "note": "Eseguire prima /api/desk/control-token/take",
+            "has_token": False,
+        }), 409
 
     try:
         desk.release_control_token()
@@ -1085,9 +1106,10 @@ def desk_prepare_and_connect_robot():
 
     if manager.is_connected:
         return jsonify({
-            "error": "pylibfranka già connesso",
+            "status": "already_connected",
             "mode": manager.robot.mode.value,
-        }), 409
+            "robot_ip": manager.robot.robot_ip,
+        }), 200
 
     if FrankaRobot is None:
         return jsonify({
@@ -1095,16 +1117,24 @@ def desk_prepare_and_connect_robot():
             "message": "Correggi l'import di FrankaRobot in app/routes/desk_api.py",
         }), 500
 
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or request.values.to_dict(flat=True) or {}
     enforce_realtime = bool(body.get("enforce_realtime", True))
 
-    try:
-        report = desk.prepare_for_fci()
+    print(f"[Desk route] prepare-and-connect start: robot_ip={desk.robot_ip}, enforce_realtime={enforce_realtime}")
 
+    try:
+        print("[Desk route] prepare-and-connect: running desk.prepare_for_fci()")
+        report = desk.prepare_for_fci()
+        sleep(10)  # Small delay to ensure Desk API state is updated
+        print("[Desk route] prepare-and-connect: desk.prepare_for_fci() completed")
+        print(f"[Desk route] prepare-and-connect: report={report}")
+        print("[Desk route] prepare-and-connect: creating FrankaRobot")
+        
         manager.robot = FrankaRobot(
             robot_ip=desk.robot_ip,
             enforce_realtime=enforce_realtime,
         )
+        print("[Desk route] prepare-and-connect: FrankaRobot created successfully")
 
         return jsonify({
             "status": "prepared_and_connected",
@@ -1117,6 +1147,7 @@ def desk_prepare_and_connect_robot():
         }), 200
 
     except Exception as exc:
+        traceback.print_exc()
         manager.robot = None
 
         return jsonify({

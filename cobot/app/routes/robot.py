@@ -84,9 +84,13 @@ def connect():
         description: Connection failed.
     """
     if manager.is_connected:
-        return jsonify({"error": "già connesso", "mode": manager.robot.mode.value}), 409
+        return jsonify({
+            "status": "already_connected",
+            "mode": manager.robot.mode.value,
+            "robot_ip": manager.robot.robot_ip,
+        }), 200
 
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or request.values.to_dict(flat=True) or {}
     robot_ip = body.get("robot_ip", "172.16.0.3")
     enforce_realtime = bool(body.get("enforce_realtime", True))
 

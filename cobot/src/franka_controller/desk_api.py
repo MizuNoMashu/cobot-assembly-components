@@ -105,7 +105,7 @@ class FrankaDeskAPI:
         username: Optional[str] = None,
         password: Optional[str] = None,
         owner: str = "franka-backend",
-        timeout: float = 5.0,
+        timeout: float = 15.0,
         verify_ssl: bool = False,
         scheme: str = "https",  # ← Torna a HTTPS (il robot redirige comunque)
     ):
@@ -341,6 +341,10 @@ class FrankaDeskAPI:
             return DeskOperatingMode(value)
         except ValueError:
             return DeskOperatingMode.UNKNOWN
+
+    def change_to_execution_mode(self) -> None:
+        self.ensure_control_token()
+
         self._request(
             method="POST",
             path="/api/system/operating-mode:change",
@@ -622,6 +626,7 @@ class FrankaDeskAPI:
 
         system_status = self.get_system_status()
         report["system_status"] = system_status.value
+        print(f"[Desk] prepare_for_fci: system_status={system_status.value}")
 
         if system_status == DeskSystemStatus.RESCUE_SYSTEM:
             raise RuntimeError(
@@ -635,6 +640,7 @@ class FrankaDeskAPI:
 
         self.ensure_control_token()
         report["steps"].append("control_token_acquired")
+        print("[Desk] prepare_for_fci: control token acquired")
 
         recovery = self.get_safety_recovery()
         report["recovery"] = recovery
@@ -644,22 +650,33 @@ class FrankaDeskAPI:
 
         operating_mode = self.get_operating_mode()
         report["operating_mode"] = operating_mode.value
+        print(f"[Desk] prepare_for_fci: operating_mode={operating_mode.value}")
 
         if operating_mode != DeskOperatingMode.EXECUTION:
+            print("[Desk] prepare_for_fci: switching to Execution")
             self.change_to_execution_mode()
             report["steps"].append("changed_to_execution")
 
         if not self.are_joints_unlocked():
+            print("[Desk] prepare_for_fci: unlocking joints")
             self.unlock_joints()
             report["steps"].append("joints_unlocked")
 
         report["joints_unlocked"] = self.are_joints_unlocked()
 
         if not self.is_fci_active():
+            print("[Desk] prepare_for_fci: activating FCI")
             self.activate_fci()
             report["steps"].append("fci_activated")
 
+            for attempt in range(6):
+                fci_state = self.get_fci_state()
+                if fci_state == DeskFCIStatus.ACTIVE:
+                    break
+                time.sleep(1.5)
+
         report["fci_status"] = self.get_fci_state().value
+        print(f"[Desk] prepare_for_fci: fci_status={report['fci_status']}")
 
         return report
 
