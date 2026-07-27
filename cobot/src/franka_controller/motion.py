@@ -262,6 +262,53 @@ class MotionController:
             print(f"✗ Errore durante movimento relativo: {error.message}")
             return False
 
+        # ------------------------------------------------------------
+    # Trajectory execution (es. traiettoria pianificata esternamente da MoveIt)
+    # ------------------------------------------------------------
+
+    def execute_trajectory(
+        self,
+        waypoints: List[List[float]],
+        speed_factor: float = 0.2,
+        tolerance: float = 0.04,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+    ) -> bool:
+        """
+        Esegue in sequenza una lista di waypoint articolari (7 valori ciascuno),
+        tipicamente i punti di una traiettoria pianificata da moveit_api.
+
+        Ogni segmento riusa move_to_joint_positions, quindi eredita le stesse
+        verifiche di sicurezza (collision/contact) e la stessa interpolazione
+        minimum-jerk. Si interrompe al primo segmento fallito senza tentare i
+        successivi. Si assume che l'ordine dei 7 valori corrisponda all'ordine
+        articolare usato altrove in questo modulo (fr3_joint1..7).
+        """
+        for waypoint in waypoints:
+            self._validate_joint_vector(waypoint, "waypoint")
+
+        print(f"[TRAJECTORY] Esecuzione di {len(waypoints)} waypoint")
+
+        for index, waypoint in enumerate(waypoints):
+            print(
+                f"[TRAJECTORY] Waypoint {index + 1}/{len(waypoints)}: "
+                f"{np.round(waypoint, 3).tolist()}"
+            )
+            success = self.move_to_joint_positions(
+                waypoint,
+                speed_factor=speed_factor,
+                tolerance=tolerance,
+                progress_callback=progress_callback,
+            )
+            if not success:
+                print(
+                    f"[TRAJECTORY] ✗ Fallito al waypoint {index + 1}/{len(waypoints)}, "
+                    "traiettoria interrotta"
+                )
+                return False
+
+        print("[TRAJECTORY] ✓ Traiettoria completata")
+        return True
+
     # ------------------------------------------------------------
     # Cartesian placeholder
     # ------------------------------------------------------------

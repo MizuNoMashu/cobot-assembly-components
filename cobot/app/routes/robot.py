@@ -510,6 +510,82 @@ def move_relative():
         return _busy()
     return jsonify({"status": "accepted", "operation": "move_relative"}), 202
 
+@robot_bp.route("/motion/execute-trajectory", methods=["POST"])
+def execute_trajectory():
+    """Execute a multi-waypoint joint trajectory.
+
+    Esegue in sequenza una lista di waypoint articolari (es. una traiettoria
+    pianificata esternamente da moveit_api, che pianifica ma non esegue mai:
+    l'attuazione resta interamente qui in cobot). Ogni waypoint viene
+    eseguito come un movimento verso un target (stessa interpolazione
+    minimum-jerk di /motion/move-joints), nell'ordine ricevuto. Si assume che
+    i 7 valori di ogni waypoint siano nello stesso ordine articolare usato da
+    /motion/move-joints e /motion/move-relative (fr3_joint1..7).
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            waypoints:
+              type: array
+              items:
+                type: array
+                items:
+                  type: number
+                minItems: 7
+                maxItems: 7
+            speed_factor:
+              type: number
+              example: 0.2
+            tolerance:
+              type: number
+              example: 0.04
+    responses:
+      202:
+        description: Motion accepted.
+      400:
+        description: Invalid waypoints.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
+    if not manager.is_connected:
+        return _not_connected()
+    if manager.is_busy:
+        return _busy()
+
+    body = request.get_json(silent=True) or {}
+    waypoints = body.get("waypoints")
+    if not waypoints or not isinstance(waypoints, list):
+        return jsonify({"error": "waypoints deve essere una lista non vuota di liste di 7 float"}), 400
+    for wp in waypoints:
+        if not isinstance(wp, list) or len(wp) != 7:
+            return jsonify({"error": "ogni waypoint deve avere esattamente 7 valori"}), 400
+
+    speed_factor = float(body.get("speed_factor", 0.2))
+    tolerance = float(body.get("tolerance", 0.04))
+    waypoints = [[float(v) for v in wp] for wp in waypoints]
+
+    started = manager.run_async(
+        manager.robot.motion.execute_trajectory,
+        waypoints,
+        speed_factor=speed_factor,
+        tolerance=tolerance,
+    )
+    if not started:
+        return _busy()
+    return jsonify({
+        "status": "accepted",
+        "operation": "execute_trajectory",
+        "num_waypoints": len(waypoints),
+    }), 202
+
 
 @robot_bp.route("/motion/impedance", methods=["POST"])
 def impedance():

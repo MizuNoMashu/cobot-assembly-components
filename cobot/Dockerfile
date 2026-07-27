@@ -47,7 +47,7 @@ RUN git clone https://github.com/stack-of-tasks/pinocchio.git /tmp/pinocchio \
         -DBUILD_BENCHMARK=OFF \
         -DBUILD_PYTHON_INTERFACE=OFF \
         -DBUILD_WITH_COLLISION_SUPPORT=OFF \
-    && cmake --build /tmp/pinocchio/build -j"$(nproc)" \
+    && cmake --build /tmp/pinocchio/build -j1 \
     && cmake --install /tmp/pinocchio/build \
     && rm -rf /tmp/pinocchio
 
@@ -62,7 +62,7 @@ RUN git clone --recursive https://github.com/frankarobotics/libfranka.git /tmp/l
         -DBUILD_EXAMPLES=OFF \
         -DBUILD_DOCUMENTATION=OFF \
         -DGENERATE_PYLIBFRANKA=OFF \
-    && cmake --build /tmp/libfranka/build_cpp -j"$(nproc)" \
+    && cmake --build /tmp/libfranka/build_cpp -j1 \
     && cmake --install /tmp/libfranka/build_cpp \
     && ldconfig \
     && python3 -m pip install --no-build-isolation /tmp/libfranka \
