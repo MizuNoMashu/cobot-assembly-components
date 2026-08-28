@@ -9,6 +9,7 @@
       "python": "${workspaceFolder}/cobot/venv/bin/python",
       "cwd": "${workspaceFolder}/cobot",
       "justMyCode": true,
+      "envFile": "${workspaceFolder}/credential.env",
       "env": {
         "FLASK_ENV": "development",
         "PYTHONUNBUFFERED": "1"
