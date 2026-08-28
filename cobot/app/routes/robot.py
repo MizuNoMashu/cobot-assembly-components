@@ -394,7 +394,7 @@ def move_home():
     return jsonify({"status": "accepted", "operation": "move_home"}), 202
 
 
-@robot_bp.route("/motion/move-joints", methods=["POST"])
+@robot_bp.route("/motion/move-joints", methods=["POST"])#TODO modificare in /motion-position-control/move-joints
 def move_joints():
     """Move to joint positions.
 
@@ -455,7 +455,7 @@ def move_joints():
     return jsonify({"status": "accepted", "operation": "move_joints"}), 202
 
 
-@robot_bp.route("/motion/move-relative", methods=["POST"])
+@robot_bp.route("/motion/move-relative", methods=["POST"]) #TODO modificare in /motion-position-control/move-relative
 def move_relative():
     """Move relative to current position.
 
@@ -587,8 +587,8 @@ def execute_trajectory():
     }), 202
 
 
-@robot_bp.route("/motion/impedance", methods=["POST"])
-def impedance():
+@robot_bp.route("/motion/impedance", methods=["POST"])#TODO modificare in /motion-position-control/impedance
+def move_to_joint_positions_with_impedance():
     if not manager.is_connected:
         return _not_connected()
     if manager.is_busy:
@@ -603,7 +603,7 @@ def impedance():
     duration = float(body.get("duration", 5.0))
 
     started = manager.run_async(
-        manager.robot.motion.impedance_control,
+        manager.robot.motion.move_to_joint_positions_with_impedance,
         [float(p) for p in positions],
         stiffness=[float(s) for s in stiffness] if stiffness else None,
         duration=duration,
@@ -612,6 +612,34 @@ def impedance():
         return _busy()
     return jsonify({"status": "accepted", "operation": "impedance"}), 202
 
+@robot_bp.route("/motion-joint-control/impedance", methods=["POST"])#TODO modificare in
+def impedance_control():
+    if not manager.is_connected:
+        return _not_connected()
+    if manager.is_busy:
+        return _busy()
+
+    body = request.get_json(silent=True) or {}
+    positions = body.get("positions")
+    if not positions or len(positions) != 7:
+        return jsonify({"error": "positions deve essere una lista di 7 float"}), 400
+
+    stiffness = body.get("stiffness")
+    damping = body.get("damping")
+    duration = float(body.get("duration", 5.0))
+    tolerance = float(body.get("tolerance", 0.04))
+
+    started = manager.run_async(
+        manager.robot.motion.impedance_control,
+        [float(p) for p in positions],
+        stiffness=[float(s) for s in stiffness] if stiffness else None,
+        damping=[float(d) for d in damping] if damping else None,
+        duration=duration,
+        tolerance=tolerance,
+    )
+    if not started:
+        return _busy()
+    return jsonify({"status": "accepted", "operation": "impedance_control"}), 202
 
 @robot_bp.route("/motion/pick-and-place", methods=["POST"])
 def pick_and_place():
