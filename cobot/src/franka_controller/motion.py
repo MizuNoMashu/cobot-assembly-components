@@ -145,189 +145,278 @@ class MotionController:
         tolerance: float = 0.04,
         progress_callback: Optional[Callable[[dict], None]] = None,
     ) -> bool:
-        """
-        Muove il robot verso una configurazione target dei giunti.
-
-        progress_callback viene chiamata ad ogni iterazione del loop real-time
-        con un dict di telemetria live. Se None, i dati vengono solo stampati.
-        """
+        """Muove i sette giunti verso una configurazione target."""
 
         self.robot._ensure_can_command()
 
+        active_control = None
+        control_finished = False
+
         try:
-            self._validate_joint_vector(target_positions, "target_positions")
+            self._validate_joint_vector(
+                target_positions,
+                "target_positions",
+            )
             self._validate_speed_factor(speed_factor)
 
-            target = np.array(target_positions)
+            if tolerance <= 0.0:
+                raise ValueError("tolerance deve essere positiva.")
 
-            print(f"[MOTION] Movimento verso posizioni target: {np.round(target, 3).tolist()}")
-            print(f"[MOTION] Speed factor: {speed_factor}, Tolerance: {tolerance}")
-            print("[MOTION] Leggendo posizione iniziale...")
+            target = np.asarray(target_positions, dtype=float)
 
             initial_state = self.robot.get_state()
-            q_start = np.array(initial_state.q)
+            q_start = np.asarray(initial_state.q_d, dtype=float)
 
-            print(f"[MOTION] Posizione iniziale: {np.round(q_start, 3).tolist()}")
+            print(
+                "[MOTION] Target:",
+                np.round(target, 3).tolist(),
+            )
+            print(
+                "[MOTION] Posizione iniziale:",
+                np.round(q_start, 3).tolist(),
+            )
 
             self.robot.mode = self.robot.mode.__class__.RUNNING
-            active_control = None
-            q_last: Optional[np.ndarray] = None
 
-            print("[MOTION] Avviando controllo posizione giunti...")
-            active_control = self.robot.robot.start_joint_position_control(
-                pylibfranka.ControllerMode.CartesianImpedance
+            active_control = (
+                self.robot.robot.start_joint_position_control(
+                    pylibfranka.ControllerMode.JointImpedance
+                )
             )
-            print("[MOTION] ✓ Controllo posizione avviato")
 
             duration = 5.0 / speed_factor
             time_elapsed = 0.0
-            motion_finished = False
-            iteration_count = 0
-            monitoring_log = []
-            previous_measured_q = q_start.copy()
+            iteration = 0
 
-            print(f"[MOTION] Durata prevista: {duration:.2f}s")
-            print("[MOTION] --- Inizio loop di controllo ---")
+            while True:
+                robot_state, period = active_control.readOnce()
 
-            while not motion_finished:
-                iteration_count += 1
+                dt = period.to_sec()
+                time_elapsed += dt
+                iteration += 1
 
-                robot_state, delta_time = active_control.readOnce()
-                cartesian_contact = np.array(robot_state.cartesian_contact, dtype=bool)
-                cartesian_collision = np.array(robot_state.cartesian_collision, dtype=bool)
+                q_measured = np.asarray(
+                    robot_state.q,
+                    dtype=float,
+                )
+                dq_measured = np.asarray(
+                    robot_state.dq,
+                    dtype=float,
+                )
 
-                if np.any(cartesian_collision):
-                    hold_cmd = pylibfranka.JointPositions(list(robot_state.q))
-                    hold_cmd.motion_finished = True
-                    active_control.writeOnce(hold_cmd)
-                    raise RuntimeError("Collisione cartesiana rilevata: movimento interrotto.")
+                cartesian_contact = np.asarray(
+                    robot_state.cartesian_contact,
+                    dtype=bool,
+                )
+                cartesian_collision = np.asarray(
+                    robot_state.cartesian_collision,
+                    dtype=bool,
+                )
 
-                if np.any(cartesian_contact):
-                    hold_cmd = pylibfranka.JointPositions(list(robot_state.q))
-                    hold_cmd.motion_finished = True
-                    active_control.writeOnce(hold_cmd)
-                    raise RuntimeError("Contatto cartesiano rilevato: movimento interrotto.")
+                if (
+                    np.any(cartesian_contact)
+                    or np.any(cartesian_collision)
+                ):
+                    stop_command = pylibfranka.JointPositions(
+                        q_measured.tolist()
+                    )
+                    stop_command.motion_finished = True
+                    active_control.writeOnce(stop_command)
+                    control_finished = True
 
-                time_elapsed += delta_time.to_sec()
-                progress = min(time_elapsed / duration, 1.0)
+                    if np.any(cartesian_collision):
+                        raise RuntimeError(
+                            "Collisione cartesiana rilevata."
+                        )
 
-                s = compute_minimum_jerk_trajectory(progress)
-                q_current = q_start + (target - q_start) * s
-                q_measured = np.array(robot_state.q)
-                measured_step = q_measured - previous_measured_q
-                previous_measured_q = q_measured.copy()
+                    raise RuntimeError(
+                        "Contatto cartesiano rilevato."
+                    )
 
-                joint_cmd = pylibfranka.JointPositions(q_current.tolist())
-                progress_pct = progress * 100.0
-                max_delta_cmd = float(np.max(np.abs(target - q_current)))
+                progress = min(
+                    time_elapsed / duration,
+                    1.0,
+                )
 
- 
-                print(f"[MOTION][LIVE] q_measured: {np.round(q_measured, 5).tolist()}")
-                print(f"[MOTION][LIVE] dq_measured: {np.round(measured_step, 5).tolist()}")
-                print(f"[MOTION][LIVE] q_command : {np.round(q_current, 5).tolist()}")
-                print(f"[MOTION][LIVE] Contact: {cartesian_contact.tolist()} | Collision: {cartesian_collision.tolist()}")
+                s = compute_minimum_jerk_trajectory(
+                    progress
+                )
 
-                if progress_callback is not None:
+                q_command = (
+                    q_start
+                    + s * (target - q_start)
+                )
+
+                command = pylibfranka.JointPositions(
+                    q_command.tolist()
+                )
+
+                command.motion_finished = (
+                    progress >= 1.0
+                )
+
+                active_control.writeOnce(command)
+
+                # Telemetria limitata per non rallentare
+                # eccessivamente il ciclo di controllo.
+                if iteration % 100 == 0:
+                    max_error = float(
+                        np.max(
+                            np.abs(
+                                target - q_measured
+                            )
+                        )
+                    )
+
+                    print(
+                        f"[MOTION] "
+                        f"{progress * 100:5.1f}% | "
+                        f"errore massimo: "
+                        f"{max_error:.5f} rad"
+                    )
+
+                # Anche il callback viene limitato.
+                if (
+                    progress_callback is not None
+                    and (
+                        iteration % 50 == 0
+                        or progress >= 1.0
+                    )
+                ):
                     progress_callback({
                         "type": "motion_progress",
-                        "iteration": iteration_count,
-                        "progress": round(progress_pct, 2),
-                        "time_elapsed": round(time_elapsed, 4),
-                        "delta_time": round(delta_time.to_sec(), 6),
-                        "q_measured": np.round(q_measured, 5).tolist(),
-                        "dq_measured": np.round(measured_step, 5).tolist(),
-                        "q_command": np.round(q_current, 5).tolist(),
-                        "contact": cartesian_contact.tolist(),
-                        "collision": cartesian_collision.tolist(),
-                        "max_delta_cmd": round(max_delta_cmd, 6),
+                        "iteration": iteration,
+                        "progress": round(
+                            progress * 100.0,
+                            2,
+                        ),
+                        "time_elapsed": round(
+                            time_elapsed,
+                            4,
+                        ),
+                        "delta_time": round(dt, 6),
+                        "q_measured": (
+                            np.round(q_measured, 6)
+                            .tolist()
+                        ),
+                        "dq_measured": (
+                            np.round(dq_measured, 6)
+                            .tolist()
+                        ),
+                        "q_command": (
+                            np.round(q_command, 6)
+                            .tolist()
+                        ),
+                        "contact": (
+                            cartesian_contact.tolist()
+                        ),
+                        "collision": (
+                            cartesian_collision.tolist()
+                        ),
                     })
 
                 if progress >= 1.0:
-                    joint_cmd.motion_finished = True
-                    motion_finished = True
-                    monitoring_log.append(
-                        f"[MOTION] Iter {iteration_count} | Progress: 100.0% | "
-                        f"Tempo: {time_elapsed:.3f}s | ✓ MOVIMENTO FINITO"
-                    )
-                else:
-                    joint_cmd.motion_finished = False
-                    if iteration_count % 20 == 0 or iteration_count == 1:
-                        monitoring_log.append(
-                            f"[MOTION] Iter {iteration_count:4d} | "
-                            f"Progress: {progress_pct:5.1f}% | "
-                            f"Tempo: {time_elapsed:6.3f}s | "
-                            f"Max delta: {np.max(np.abs(target - q_current)):.4f} rad | "
-                            f"dT: {delta_time.to_sec():.4f}s"
-                        )
-
-                active_control.writeOnce(joint_cmd)
-
+                    control_finished = True
+                    break
 
             final_state = self.robot.get_state()
-            q_final_real = np.array(final_state.q)
-            final_error_vector = target - q_final_real
-            final_error = np.max(np.abs(final_error_vector))
+            q_final = np.asarray(
+                final_state.q,
+                dtype=float,
+            )
 
-            print(f"[MOTION] --- Fine loop ({iteration_count} iterazioni) ---")
-            print(f"[MOTION] Errore finale massimo: {final_error:.6f} rad")
+            final_error = float(
+                np.max(
+                    np.abs(target - q_final)
+                )
+            )
+
+            print(
+                "[MOTION] Posizione finale:",
+                np.round(q_final, 4).tolist(),
+            )
+            print(
+                f"[MOTION] Errore massimo finale: "
+                f"{final_error:.6f} rad"
+            )
 
             if final_error > tolerance:
                 raise RuntimeError(
-                    f"Tolleranza non rispettata: errore={final_error:.6f} rad, "
+                    "Tolleranza non rispettata: "
+                    f"errore={final_error:.6f} rad, "
                     f"tolleranza={tolerance:.6f} rad."
                 )
 
-            self.robot.mode = self.robot.mode.__class__.READY
-            print("✓ Movimento completato con successo")
+            self.robot.mode = (
+                self.robot.mode.__class__.READY
+            )
+
+            print("✓ Movimento completato")
             return True
 
-        except pylibfranka.ControlException as e:
+        except pylibfranka.ControlException as exc:
             error = self.robot._enter_error_locked(
-                operation="motion/move_to_joint_positions (ControlException)",
-                exception=e,
+                operation=(
+                    "motion/move_to_joint_positions "
+                    "(ControlException)"
+                ),
+                exception=exc,
                 recoverable=False,
             )
-            print(f"✗ ControlException durante il movimento: {error.message}")
-            if "cartesian_reflex" in str(e):
-                print("✗ [SAFETY] Cartesian reflex: contatto rilevato.")
+
+            print(
+                "✗ ControlException durante il movimento: "
+                f"{error.message}"
+            )
             traceback.print_exc()
             return False
 
-        except RuntimeError as e:
+        except RuntimeError as exc:
             error = self.robot._enter_error_locked(
-                operation="motion/move_to_joint_positions (RuntimeError)",
-                exception=e,
+                operation=(
+                    "motion/move_to_joint_positions "
+                    "(RuntimeError)"
+                ),
+                exception=exc,
                 recoverable=False,
             )
-            print(f"✗ Errore critico durante il movimento: {error.message}")
+
+            print(
+                "✗ Movimento interrotto: "
+                f"{error.message}"
+            )
             traceback.print_exc()
             return False
 
-        except Exception as e:
+        except Exception as exc:
             error = self.robot._enter_error_locked(
-                operation="motion/move_to_joint_positions (Exception)",
-                exception=e,
+                operation=(
+                    "motion/move_to_joint_positions "
+                    "(Exception)"
+                ),
+                exception=exc,
                 recoverable=True,
             )
-            print(f"✗ Errore durante il movimento: {error.message}")
+
+            print(
+                "✗ Errore durante il movimento: "
+                f"{error.message}"
+            )
             traceback.print_exc()
             return False
 
         finally:
-            if active_control is not None:
-                try:
-                    if q_last is None:
-                        q_last = np.array(self.robot.get_state().q)
-                    hold_cmd = pylibfranka.JointPositions(q_last.tolist())
-                    hold_cmd.motion_finished = True
-                    active_control.writeOnce(hold_cmd)
-                except Exception as cleanup_exc:
-                    print(f"[MOTION] Cleanup active control failed: {cleanup_exc}")
+            if (
+                active_control is not None
+                and not control_finished
+            ):
                 try:
                     self.robot.robot.stop()
                 except Exception as cleanup_exc:
-                    print(f"[MOTION] Robot.stop() failed during cleanup: {cleanup_exc}")
-
+                    print(
+                        "[MOTION] Arresto fallito: "
+                        f"{cleanup_exc}"
+                    )
     # ------------------------------------------------------------
     # Relative joint motion
     # ------------------------------------------------------------
