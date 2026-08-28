@@ -7,9 +7,10 @@ import numpy as np
 from typing import List, Optional, Callable, Tuple
 
 import pylibfranka
+from .utils import compute_minimum_jerk_trajectory
 
 
-def _rpy_to_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+def _rpy_to_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:#I valori sono in radianti
     Rx = np.array([
         [1.0, 0.0, 0.0],
         [0.0, np.cos(roll), -np.sin(roll)],
@@ -101,7 +102,7 @@ def _rotation_matrix_to_rpy(R: np.ndarray) -> Tuple[float, float, float]:
 
 
 def _build_cartesian_pose(x: float, y: float, z: float, roll: float, pitch: float, yaw: float) -> np.ndarray:
-    pose = np.eye(4, dtype=float)
+    pose = np.eye(4, dtype=float) #create a 4x4 identity matrix
     pose[:3, :3] = _rpy_to_rotation_matrix(roll, pitch, yaw)
     pose[:3, 3] = [x, y, z]
     return pose
@@ -150,7 +151,6 @@ class MotionController:
         progress_callback viene chiamata ad ogni iterazione del loop real-time
         con un dict di telemetria live. Se None, i dati vengono solo stampati.
         """
-        from .utils import compute_minimum_jerk_trajectory
 
         self.robot._ensure_can_command()
 
@@ -439,6 +439,7 @@ class MotionController:
             target_pose = _build_cartesian_pose(x, y, z, roll, pitch, yaw)
             current_pose = self.robot.get_current_cartesian_pose()
             current_rot = current_pose[:3, :3]
+            current_pos = current_pose[:3, 3]
             current_quat = _rotation_matrix_to_quaternion(current_rot)
             target_quat = _rotation_matrix_to_quaternion(target_pose[:3, :3])
 
