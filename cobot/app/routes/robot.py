@@ -14,7 +14,9 @@ manager = RobotManager()
 
 
 def _busy():
-    return jsonify({"error": "robot occupato, attendere il completamento dell'operazione corrente"}), 409
+    return jsonify(
+        {"error": "robot occupato, attendere il completamento dell'operazione corrente"}
+    ), 409
 
 
 def _not_connected():
@@ -24,6 +26,7 @@ def _not_connected():
 # ------------------------------------------------------------------
 # Connection
 # ------------------------------------------------------------------
+
 
 @robot_bp.route("/robot/disconnect", methods=["POST"])
 def disconnect():
@@ -84,18 +87,22 @@ def connect():
         description: Connection failed.
     """
     if manager.is_connected:
-        return jsonify({
-            "status": "already_connected",
-            "mode": manager.robot.mode.value,
-            "robot_ip": manager.robot.robot_ip,
-        }), 200
+        return jsonify(
+            {
+                "status": "already_connected",
+                "mode": manager.robot.mode.value,
+                "robot_ip": manager.robot.robot_ip,
+            }
+        ), 200
 
     body = request.get_json(silent=True) or request.values.to_dict(flat=True) or {}
     robot_ip = body.get("robot_ip", "172.16.0.3")
     enforce_realtime = bool(body.get("enforce_realtime", True))
 
     try:
-        manager.robot = FrankaRobot(robot_ip=robot_ip, enforce_realtime=enforce_realtime)
+        manager.robot = FrankaRobot(
+            robot_ip=robot_ip, enforce_realtime=enforce_realtime
+        )
         return jsonify({"status": "connected", "mode": manager.robot.mode.value}), 200
     except Exception as exc:
         manager.robot = None
@@ -105,6 +112,7 @@ def connect():
 # ------------------------------------------------------------------
 # Robot config
 # ------------------------------------------------------------------
+
 
 @robot_bp.route("/robot/config", methods=["GET"])
 def robot_config():
@@ -136,16 +144,19 @@ def robot_config():
         ip = "172.16.0.3"
         enforce = True
 
-    return jsonify({
-        "robot_ip": ip,
-        "enforce_realtime": enforce,
-        "fci_note": "FCI ports are fixed by libfranka (1337/1338), not configurable via pylibfranka",
-    }), 200
+    return jsonify(
+        {
+            "robot_ip": ip,
+            "enforce_realtime": enforce,
+            "fci_note": "FCI ports are fixed by libfranka (1337/1338), not configurable via pylibfranka",
+        }
+    ), 200
 
 
 # ------------------------------------------------------------------
 # Robot state & errors
 # ------------------------------------------------------------------
+
 
 @robot_bp.route("/robot/state", methods=["GET"])
 def robot_state():
@@ -355,6 +366,7 @@ def collision_behavior():
 # Motion endpoints (asincroni – 202 Accepted)
 # ------------------------------------------------------------------
 
+
 @robot_bp.route("/motion/move-home", methods=["POST"])
 def move_home():
     """Move robot to home position.
@@ -388,13 +400,15 @@ def move_home():
     body = request.get_json(silent=True) or {}
     speed_factor = float(body.get("speed_factor", 0.2))
 
-    started = manager.run_async(manager.robot.motion.go_to_home, speed_factor=speed_factor)
+    started = manager.run_async(
+        manager.robot.motion.go_to_home, speed_factor=speed_factor
+    )
     if not started:
         return _busy()
     return jsonify({"status": "accepted", "operation": "move_home"}), 202
 
 
-@robot_bp.route("/motion/move-joints", methods=["POST"])#TODO modificare in /motion-position-control/move-joints
+@robot_bp.route("/motion-position-control/move", methods=["POST"])
 def move_joints():
     """Move to joint positions.
 
@@ -455,8 +469,161 @@ def move_joints():
     return jsonify({"status": "accepted", "operation": "move_joints"}), 202
 
 
-@robot_bp.route("/motion/move-relative", methods=["POST"]) #TODO modificare in /motion-position-control/move-relative
+@robot_bp.route("/motion-position-control/move-relative", methods=["POST"])
 def move_relative():
+    """Move relative to current position.
+
+    Moves the robot by relative Cartesian deltas from current position.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            dx:
+              type: number
+            dy:
+              type: number
+            dz:
+              type: number
+            droll:
+              type: number
+            dpitch:
+              type: number
+            dyaw:
+              type: number
+            speed_factor:
+              type: number
+              example: 0.2
+    responses:
+      202:
+        description: Motion accepted.
+      400:
+        description: Invalid Cartesian deltas.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
+    if not manager.is_connected:
+        return _not_connected()
+    if manager.is_busy:
+        return _busy()
+
+    body = request.get_json(silent=True) or {}
+    try:
+        deltas = [
+            float(body.get(value, 0.0))
+            for value in ("dx", "dy", "dz", "droll", "dpitch", "dyaw")
+        ]
+        speed_factor = float(body.get("speed_factor", 0.2))
+        tolerance = float(body.get("tolerance", 0.01))
+    except (TypeError, ValueError):
+        return jsonify(
+            {"error": "i parametri dello spostamento devono essere float"}
+        ), 400
+
+    started = manager.run_async(
+        manager.robot.motion.move_relative,
+        *deltas,
+        speed_factor=speed_factor,
+        tolerance=tolerance,
+    )
+    if not started:
+        return _busy()
+    return jsonify({"status": "accepted", "operation": "move_relative_cartesian"}), 202
+
+
+@robot_bp.route("/motion-cartesian/move", methods=["POST"])
+def move_cartesian():
+    """Move to a cartesian pose.
+
+    Moves the robot to the specified cartesian position and orientation.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            x:
+              type: number
+            y:
+              type: number
+            z:
+              type: number
+            roll:
+              type: number
+              default: 0.0
+            pitch:
+              type: number
+              default: 0.0
+            yaw:
+              type: number
+              default: 0.0
+            speed_factor:
+              type: number
+              example: 0.2
+            tolerance:
+              type: number
+              example: 0.01
+            orientation_tolerance:
+              type: number
+              example: 0.05
+    responses:
+      202:
+        description: Motion accepted.
+      400:
+        description: Invalid cartesian pose.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
+    if not manager.is_connected:
+        return _not_connected()
+    if manager.is_busy:
+        return _busy()
+
+    body = request.get_json(silent=True) or {}
+    required = ("x", "y", "z")
+    if any(body.get(value) is None for value in required):
+        return jsonify(
+            {"error": "x, y e z sono obbligatori e devono essere float"}
+        ), 400
+
+    try:
+        pose = [
+            float(body.get(value, 0.0))
+            for value in ("x", "y", "z", "roll", "pitch", "yaw")
+        ]
+        speed_factor = float(body.get("speed_factor", 0.2))
+        tolerance = float(body.get("tolerance", 0.01))
+        orientation_tolerance = float(body.get("orientation_tolerance", 0.05))
+    except (TypeError, ValueError):
+        return jsonify({"error": "i parametri della posa devono essere float"}), 400
+
+    started = manager.run_async(
+        manager.robot.motion.move_to_cartesian_pose,
+        *pose,
+        speed_factor=speed_factor,
+        tolerance=tolerance,
+        orientation_tolerance=orientation_tolerance,
+    )
+    if not started:
+        return _busy()
+    return jsonify({"status": "accepted", "operation": "move_cartesian_pose"}), 202
+
+
+@robot_bp.route("/motion-cartesian/move-relative", methods=["POST"])
+def move_relative_cartesian():
     """Move relative to current position.
 
     Moves the robot by relative joint deltas from current position.
@@ -510,7 +677,8 @@ def move_relative():
         return _busy()
     return jsonify({"status": "accepted", "operation": "move_relative"}), 202
 
-@robot_bp.route("/motion/execute-trajectory", methods=["POST"])
+
+@robot_bp.route("/motion-position-control/execute-trajectory", methods=["POST"])
 def execute_trajectory():
     """Execute a multi-waypoint joint trajectory.
 
@@ -563,10 +731,14 @@ def execute_trajectory():
     body = request.get_json(silent=True) or {}
     waypoints = body.get("waypoints")
     if not waypoints or not isinstance(waypoints, list):
-        return jsonify({"error": "waypoints deve essere una lista non vuota di liste di 7 float"}), 400
+        return jsonify(
+            {"error": "waypoints deve essere una lista non vuota di liste di 7 float"}
+        ), 400
     for wp in waypoints:
         if not isinstance(wp, list) or len(wp) != 7:
-            return jsonify({"error": "ogni waypoint deve avere esattamente 7 valori"}), 400
+            return jsonify(
+                {"error": "ogni waypoint deve avere esattamente 7 valori"}
+            ), 400
 
     speed_factor = float(body.get("speed_factor", 0.2))
     tolerance = float(body.get("tolerance", 0.04))
@@ -580,14 +752,16 @@ def execute_trajectory():
     )
     if not started:
         return _busy()
-    return jsonify({
-        "status": "accepted",
-        "operation": "execute_trajectory",
-        "num_waypoints": len(waypoints),
-    }), 202
+    return jsonify(
+        {
+            "status": "accepted",
+            "operation": "execute_trajectory",
+            "num_waypoints": len(waypoints),
+        }
+    ), 202
 
 
-@robot_bp.route("/motion/impedance", methods=["POST"])#TODO modificare in /motion-position-control/impedance
+@robot_bp.route("/motion-position-control/move-impedance", methods=["POST"])
 def move_to_joint_positions_with_impedance():
     if not manager.is_connected:
         return _not_connected()
@@ -612,7 +786,8 @@ def move_to_joint_positions_with_impedance():
         return _busy()
     return jsonify({"status": "accepted", "operation": "impedance"}), 202
 
-@robot_bp.route("/motion-joint-control/impedance", methods=["POST"])#TODO modificare in
+
+@robot_bp.route("/motion-joint-control/move", methods=["POST"])  # TODO modificare in
 def impedance_control():
     if not manager.is_connected:
         return _not_connected()
@@ -641,6 +816,7 @@ def impedance_control():
         return _busy()
     return jsonify({"status": "accepted", "operation": "impedance_control"}), 202
 
+
 @robot_bp.route("/motion/pick-and-place", methods=["POST"])
 def pick_and_place():
     """
@@ -664,7 +840,9 @@ def pick_and_place():
 
     body = request.get_json(silent=True) or {}
     pick_position = body.get("pick_position", [0.3, -0.5, 0.0, -2.0, 0.0, 1.5, 0.785])
-    place_position = body.get("place_position", [-0.3, -0.5, 0.0, -2.0, 0.0, 1.5, 0.785])
+    place_position = body.get(
+        "place_position", [-0.3, -0.5, 0.0, -2.0, 0.0, 1.5, 0.785]
+    )
     grasp_width_m = float(body.get("grasp_width_mm", 50.0)) / 1000.0
     grasp_force = float(body.get("grasp_force", 60.0))
     speed_factor = float(body.get("speed_factor", 0.15))
@@ -680,7 +858,9 @@ def pick_and_place():
 
         try:
             _step("Step 1/7: home position")
-            robot.motion.go_to_home(speed_factor=speed_factor, progress_callback=progress_callback)
+            robot.motion.go_to_home(
+                speed_factor=speed_factor, progress_callback=progress_callback
+            )
 
             _step("Step 2/7: apertura gripper")
             robot.gripper.open(width=0.08, speed=0.1)
@@ -706,7 +886,9 @@ def pick_and_place():
             robot.gripper.release()
 
             _step("Step 7/7: ritorno a home")
-            robot.motion.go_to_home(speed_factor=speed_factor, progress_callback=progress_callback)
+            robot.motion.go_to_home(
+                speed_factor=speed_factor, progress_callback=progress_callback
+            )
 
             _step("✓ Workflow completato")
             return True
