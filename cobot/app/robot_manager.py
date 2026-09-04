@@ -11,6 +11,8 @@ import threading
 import traceback
 from typing import Optional, Callable, Any
 
+import numpy as np
+
 from franka_controller import FrankaRobot
 
 
@@ -138,6 +140,11 @@ class RobotManager:
         if not self.is_connected:
             raise RuntimeError("Robot non connesso.")
 
+        if self.robot.mode.value == "error_locked":
+            error = self.robot.last_error
+            message = error.message if error is not None else "Robot in ERROR_LOCKED."
+            raise RuntimeError(f"Robot in ERROR_LOCKED: {message}")
+
         if self.is_busy:
             if self._cached_state:
                 return dict(self._cached_state)
@@ -145,7 +152,7 @@ class RobotManager:
 
         with self._operation_lock:
             state = self.robot.get_state()
-            pose = self.robot.get_current_cartesian_pose()
+            pose = np.array(state.O_T_EE).reshape(4, 4, order="F")
             pos = pose[:3, 3]
             orientation = pose[:3, :3]
             return {

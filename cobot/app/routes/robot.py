@@ -179,7 +179,8 @@ def robot_state():
     try:
         return jsonify(manager.get_robot_state()), 200
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+      status_code = 503 if manager.robot.mode.value == "error_locked" else 500
+      return jsonify({"error": str(exc)}), status_code
 
 
 @robot_bp.route("/robot/status", methods=["GET"])
@@ -469,8 +470,8 @@ def move_joints():
     return jsonify({"status": "accepted", "operation": "move_joints"}), 202
 
 
-@robot_bp.route("/motion-position-control/move-relative", methods=["POST"])
-def move_relative():
+@robot_bp.route("/motion-cartesian/move-relative", methods=["POST"])
+def move_relative_cartesian():
     """Move relative to current position.
 
     Moves the robot by relative Cartesian deltas from current position.
@@ -622,8 +623,8 @@ def move_cartesian():
     return jsonify({"status": "accepted", "operation": "move_cartesian_pose"}), 202
 
 
-@robot_bp.route("/motion-cartesian/move-relative", methods=["POST"])
-def move_relative_cartesian():
+@robot_bp.route("/motion-position-control/move-relative", methods=["POST"])
+def move_relative_joints():
     """Move relative to current position.
 
     Moves the robot by relative joint deltas from current position.
@@ -763,6 +764,47 @@ def execute_trajectory():
 
 @robot_bp.route("/motion-position-control/move-impedance", methods=["POST"])
 def move_to_joint_positions_with_impedance():
+    """Move to joint positions with impedance control.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            positions:
+              type: array
+              items:
+                type: number
+              minItems: 7
+              maxItems: 7
+            stiffness:
+              type: array
+              items:
+                type: number
+            damping:
+              type: array
+              items:
+                type: number
+            duration:
+              type: number
+              default: 5.0
+            tolerance:
+              type: number
+              default: 0.04
+    responses:
+      202:
+        description: Motion accepted.
+      400:
+        description: Invalid joint positions.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
     if not manager.is_connected:
         return _not_connected()
     if manager.is_busy:
@@ -787,8 +829,49 @@ def move_to_joint_positions_with_impedance():
     return jsonify({"status": "accepted", "operation": "impedance"}), 202
 
 
-@robot_bp.route("/motion-joint-control/move", methods=["POST"])  # TODO modificare in
+@robot_bp.route("/motion-joint-control/move", methods=["POST"])
 def impedance_control():
+    """Move joints with impedance control.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            positions:
+              type: array
+              items:
+                type: number
+              minItems: 7
+              maxItems: 7
+            stiffness:
+              type: array
+              items:
+                type: number
+            damping:
+              type: array
+              items:
+                type: number
+            duration:
+              type: number
+              default: 5.0
+            tolerance:
+              type: number
+              default: 0.04
+    responses:
+      202:
+        description: Motion accepted.
+      400:
+        description: Invalid joint positions.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
     if not manager.is_connected:
         return _not_connected()
     if manager.is_busy:

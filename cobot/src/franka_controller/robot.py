@@ -128,7 +128,12 @@ class FrankaRobot:
         if "realtime" in msg or "priority" in msg or "scheduler" in msg:
             return RobotErrorType.REALTIME
 
-        if "connect" in msg or "connection" in msg or "network" in msg:
+        if (
+            "connect" in msg
+            or "connection" in msg
+            or "network" in msg
+            or "net exception" in msg
+        ):
             return RobotErrorType.CONNECTION
 
         if "communication" in msg or "timeout" in msg or "packet" in msg:

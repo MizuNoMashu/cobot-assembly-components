@@ -604,21 +604,33 @@ class MotionController:
         speed_factor: float = 0.2,
         tolerance: float = 0.01,
         orientation_tolerance: float = 0.05,
+        settling_timeout: float = 5.0,
         progress_callback: Optional[
             Callable[[dict], None]
         ] = None,
-    ) -> bool:
+        ) -> bool:
         """
-        Muove l'end-effector verso una posa cartesiana target.
+        Muove l'end-effector verso una posa cartesiana assoluta.
 
         Unità:
-            x, y, z               metri
-            roll, pitch, yaw      radianti
-            tolerance             metri
-            orientation_tolerance radianti
+            x, y, z                 metri
+            roll, pitch, yaw        radianti
+            tolerance               metri
+            orientation_tolerance   radianti
+            settling_timeout        secondi
 
         Convenzione RPY:
             R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+
+        Comportamento:
+            1. Genera una traiettoria minimum-jerk.
+            2. Al termine della durata nominale continua a comandare
+            la posa target.
+            3. Termina quando posizione e orientamento entrano nelle
+            rispettive tolleranze.
+            4. Se scade settling_timeout, termina con warning e
+            restituisce False senza impostare ERROR_LOCKED.
+            5. Collisioni e ControlException impostano ERROR_LOCKED.
         """
 
         self.robot._ensure_can_command()
@@ -627,22 +639,37 @@ class MotionController:
         control_finished = False
         last_command_pose = None
 
+        collision_detected = False
+        contact_detected = False
+
         try:
-            # --------------------------------------------------------
-            # Validazione degli input
-            # --------------------------------------------------------
+            # ============================================================
+            # Validazione
+            # ============================================================
 
             self._validate_speed_factor(speed_factor)
 
-            if tolerance <= 0.0:
+            if not np.isfinite(tolerance) or tolerance <= 0.0:
                 raise ValueError(
-                    "tolerance deve essere positiva."
+                    "tolerance deve essere positiva e finita."
                 )
 
-            if orientation_tolerance <= 0.0:
+            if (
+                not np.isfinite(orientation_tolerance)
+                or orientation_tolerance <= 0.0
+            ):
                 raise ValueError(
                     "orientation_tolerance deve essere "
-                    "positiva."
+                    "positiva e finita."
+                )
+
+            if (
+                not np.isfinite(settling_timeout)
+                or settling_timeout < 0.0
+            ):
+                raise ValueError(
+                    "settling_timeout deve essere finito e "
+                    "maggiore o uguale a zero."
                 )
 
             target_values = np.asarray(
@@ -652,56 +679,41 @@ class MotionController:
 
             if not np.all(np.isfinite(target_values)):
                 raise ValueError(
-                    "La posa target contiene valori "
-                    "non finiti."
+                    "La posa target contiene valori non finiti."
                 )
 
-            # --------------------------------------------------------
-            # Costruzione della posa target
-            # --------------------------------------------------------
+            # ============================================================
+            # Costruzione target
+            # ============================================================
 
             target_pose = _build_cartesian_pose(
-                x,
-                y,
-                z,
-                roll,
-                pitch,
-                yaw,
+                x=x,
+                y=y,
+                z=z,
+                roll=roll,
+                pitch=pitch,
+                yaw=yaw,
             )
 
-            target_position = (
-                target_pose[:3, 3].copy()
-            )
+            target_position = target_pose[:3, 3].copy()
+            target_rotation = target_pose[:3, :3].copy()
 
-            target_rotation = (
-                target_pose[:3, :3].copy()
-            )
-
-            target_quat = (
-                _rotation_matrix_to_quaternion(
-                    target_rotation
-                )
+            target_quat = _rotation_matrix_to_quaternion(
+                target_rotation
             )
 
             print(
                 "[MOTION] Posizione target:",
-                np.round(
-                    target_position,
-                    4,
-                ).tolist(),
+                np.round(target_position, 6).tolist(),
             )
 
             print(
                 "[MOTION] Orientamento target RPY:",
-                np.round(
-                    [roll, pitch, yaw],
-                    4,
-                ).tolist(),
+                np.round([roll, pitch, yaw], 6).tolist(),
             )
 
             print(
-                f"[MOTION] Speed factor: "
-                f"{speed_factor}"
+                f"[MOTION] Speed factor: {speed_factor:.3f}"
             )
 
             print(
@@ -715,130 +727,187 @@ class MotionController:
                 f"({np.rad2deg(orientation_tolerance):.3f}°)"
             )
 
-            # --------------------------------------------------------
-            # Avvio del controllo cartesiano
-            # --------------------------------------------------------
-
-            self.robot.mode = (
-                self.robot.mode.__class__.RUNNING
+            print(
+                f"[MOTION] Timeout assestamento: "
+                f"{settling_timeout:.3f} s"
             )
+
+            # ============================================================
+            # Avvio controllo cartesiano
+            # ============================================================
+
+            self.robot.mode = self.robot.mode.__class__.RUNNING
 
             active_control = (
-                self.robot.robot
-                .start_cartesian_pose_control(
-                    pylibfranka.ControllerMode
-                    .CartesianImpedance
+                self.robot.robot.start_cartesian_pose_control(
+                    pylibfranka.ControllerMode.JointImpedance
                 )
             )
 
-            print(
-                "[MOTION] Controllo cartesiano avviato."
-            )
+            print("[MOTION] Controllo cartesiano avviato.")
 
-            # --------------------------------------------------------
-            # Lettura della posa iniziale
-            # --------------------------------------------------------
+            # ============================================================
+            # Lettura posa iniziale
+            # ============================================================
 
-            initial_state, _ = (
-                active_control.readOnce()
-            )
+            initial_state, _ = active_control.readOnce()
 
-            # Si usa la posa desiderata precedente per
-            # garantire continuità del riferimento.
-            #
-            # Se O_T_EE_d non fosse disponibile, viene
-            # utilizzata la posa misurata O_T_EE.
             if hasattr(initial_state, "O_T_EE_d"):
-                initial_pose_data = (
-                    initial_state.O_T_EE_d
-                )
+                initial_pose_data = initial_state.O_T_EE_d
             else:
-                initial_pose_data = (
-                    initial_state.O_T_EE
-                )
+                initial_pose_data = initial_state.O_T_EE
 
-            current_pose = np.asarray(
+            initial_pose = np.asarray(
                 initial_pose_data,
                 dtype=float,
-            ).reshape(
-                (4, 4),
-                order="F",
+            ).reshape((4, 4), order="F")
+
+            initial_position = initial_pose[:3, 3].copy()
+            initial_rotation = initial_pose[:3, :3].copy()
+
+            initial_quat = _rotation_matrix_to_quaternion(
+                initial_rotation
             )
 
-            current_position = (
-                current_pose[:3, 3].copy()
-            )
-
-            current_rotation = (
-                current_pose[:3, :3].copy()
-            )
-
-            current_quat = (
-                _rotation_matrix_to_quaternion(
-                    current_rotation
-                )
-            )
-
-            last_command_pose = (
-                current_pose.copy()
-            )
+            last_command_pose = initial_pose.copy()
 
             print(
                 "[MOTION] Posizione iniziale:",
-                np.round(
-                    current_position,
-                    4,
-                ).tolist(),
+                np.round(initial_position, 6).tolist(),
             )
 
-            # --------------------------------------------------------
-            # Parametri temporali
-            # --------------------------------------------------------
+            initial_position_distance = float(
+                np.linalg.norm(
+                    target_position - initial_position
+                )
+            )
 
-            duration = 5.0 / speed_factor
+            initial_quaternion_dot = abs(
+                float(np.dot(initial_quat, target_quat))
+            )
+
+            initial_orientation_distance = float(
+                2.0
+                * np.arccos(
+                    np.clip(
+                        initial_quaternion_dot,
+                        0.0,
+                        1.0,
+                    )
+                )
+            )
+
+            print(
+                f"[MOTION] Spostamento richiesto: "
+                f"{initial_position_distance:.6f} m"
+            )
+
+            print(
+                f"[MOTION] Rotazione richiesta: "
+                f"{initial_orientation_distance:.6f} rad "
+                f"({np.rad2deg(initial_orientation_distance):.3f}°)"
+            )
+
+            # Mantiene la stessa legge temporale del metodo originale.
+            trajectory_duration = 5.0 / speed_factor
+
+            maximum_duration = (
+                trajectory_duration + settling_timeout
+            )
+
+            print(
+                f"[MOTION] Durata nominale: "
+                f"{trajectory_duration:.3f} s"
+            )
+
+            # ============================================================
+            # Variabili del controllo
+            # ============================================================
+
             time_elapsed = 0.0
             iteration_count = 0
 
-            print(
-                f"[MOTION] Durata prevista: "
-                f"{duration:.3f} s"
+            settling_warning_printed = False
+            settling_timeout_reached = False
+            target_reached = False
+
+            last_robot_pose = initial_pose.copy()
+
+            last_position_error = initial_position_distance
+            last_orientation_error = (
+                initial_orientation_distance
             )
 
-            # --------------------------------------------------------
-            # Ciclo di controllo
-            # --------------------------------------------------------
+            # ============================================================
+            # Ciclo real-time
+            # ============================================================
 
             while True:
                 robot_state, delta_time = (
                     active_control.readOnce()
                 )
 
-                dt = delta_time.to_sec()
+                dt = float(delta_time.to_sec())
+
+                if not np.isfinite(dt) or dt < 0.0:
+                    raise RuntimeError(
+                        f"Delta time non valido: {dt}."
+                    )
+
                 time_elapsed += dt
                 iteration_count += 1
 
-                # Posa misurata del robot.
+                # --------------------------------------------------------
+                # Posa misurata: O_T_EE
+                # --------------------------------------------------------
+
                 robot_pose = np.asarray(
                     robot_state.O_T_EE,
                     dtype=float,
-                ).reshape(
-                    (4, 4),
-                    order="F",
+                ).reshape((4, 4), order="F")
+
+                robot_position = robot_pose[:3, 3].copy()
+                robot_rotation = robot_pose[:3, :3].copy()
+
+                robot_quat = _rotation_matrix_to_quaternion(
+                    robot_rotation
                 )
 
-                robot_position = (
-                    robot_pose[:3, 3].copy()
+                last_robot_pose = robot_pose.copy()
+
+                # --------------------------------------------------------
+                # Ultima posa comandata: O_T_EE_c
+                # --------------------------------------------------------
+
+                commanded_robot_pose = np.asarray(
+                    robot_state.O_T_EE_c,
+                    dtype=float,
+                ).reshape((4, 4), order="F")
+
+                commanded_robot_position = (
+                    commanded_robot_pose[:3, 3].copy()
                 )
 
-                robot_rotation = (
-                    robot_pose[:3, :3].copy()
+                # --------------------------------------------------------
+                # Posa desiderata interna: O_T_EE_d
+                # --------------------------------------------------------
+
+                desired_robot_pose = np.asarray(
+                    robot_state.O_T_EE_d,
+                    dtype=float,
+                ).reshape((4, 4), order="F")
+
+                desired_robot_position = (
+                    desired_robot_pose[:3, 3].copy()
                 )
 
-                robot_quat = (
-                    _rotation_matrix_to_quaternion(
-                        robot_rotation
-                    )
+                control_command_success_rate = float(
+                    robot_state.control_command_success_rate
                 )
+
+                # --------------------------------------------------------
+                # Contatto e collisione
+                # --------------------------------------------------------
 
                 cartesian_contact = np.asarray(
                     robot_state.cartesian_contact,
@@ -850,48 +919,50 @@ class MotionController:
                     dtype=bool,
                 )
 
-                # ----------------------------------------------------
-                # Gestione di contatto e collisione
-                # ----------------------------------------------------
+                if np.any(cartesian_collision):
+                    collision_detected = True
 
-                if (
-                    np.any(cartesian_contact)
-                    or np.any(cartesian_collision)
-                ):
-                    # Termina usando l'ultima posa comandata.
-                    # Usare direttamente la posa misurata potrebbe
-                    # introdurre una discontinuità nel riferimento.
-                    stop_command = (
-                        _pose_to_cartesian_command(
-                            last_command_pose
-                        )
+                    stop_command = _pose_to_cartesian_command(
+                        last_command_pose
                     )
 
                     stop_command.motion_finished = True
 
-                    active_control.writeOnce(
-                        stop_command
-                    )
-
+                    active_control.writeOnce(stop_command)
                     control_finished = True
 
-                    if np.any(cartesian_collision):
-                        raise RuntimeError(
-                            "Collisione cartesiana rilevata: "
-                            "movimento interrotto."
-                        )
+                    raise RuntimeError(
+                        "Collisione cartesiana rilevata: "
+                        "movimento interrotto."
+                    )
+
+                if np.any(cartesian_contact):
+                    contact_detected = True
+
+                    stop_command = _pose_to_cartesian_command(
+                        last_command_pose
+                    )
+
+                    stop_command.motion_finished = True
+
+                    active_control.writeOnce(stop_command)
+                    control_finished = True
 
                     raise RuntimeError(
                         "Contatto cartesiano rilevato: "
                         "movimento interrotto."
                     )
 
-                # ----------------------------------------------------
-                # Avanzamento temporale
-                # ----------------------------------------------------
+                # --------------------------------------------------------
+                # Fase temporale
+                # --------------------------------------------------------
+
+                trajectory_complete = (
+                    time_elapsed >= trajectory_duration
+                )
 
                 progress = min(
-                    time_elapsed / duration,
+                    time_elapsed / trajectory_duration,
                     1.0,
                 )
 
@@ -899,92 +970,151 @@ class MotionController:
                     progress
                 )
 
-                # ----------------------------------------------------
-                # Interpolazione della posizione
-                # ----------------------------------------------------
+                # --------------------------------------------------------
+                # Comando cartesiano
+                # --------------------------------------------------------
 
-                position_command = (
-                    current_position
-                    + s
-                    * (
-                        target_position
-                        - current_position
+                if not trajectory_complete:
+                    position_command = (
+                        initial_position
+                        + s
+                        * (
+                            target_position
+                            - initial_position
+                        )
                     )
-                )
 
-                # ----------------------------------------------------
-                # Interpolazione dell'orientamento
-                # ----------------------------------------------------
-
-                quaternion_command = (
-                    _slerp_quaternion(
-                        current_quat,
+                    quaternion_command = _slerp_quaternion(
+                        initial_quat,
                         target_quat,
                         s,
                     )
-                )
 
-                rotation_command = (
-                    _quaternion_to_rotation_matrix(
-                        quaternion_command
+                    rotation_command = (
+                        _quaternion_to_rotation_matrix(
+                            quaternion_command
+                        )
                     )
-                )
 
-                # ----------------------------------------------------
-                # Ricostruzione della posa comandata
-                # ----------------------------------------------------
+                    phase = "TRAJECTORY"
 
-                pose_command = np.eye(
-                    4,
-                    dtype=float,
-                )
+                else:
+                    # Mantiene esattamente il riferimento target durante
+                    # la fase di assestamento.
+                    position_command = target_position.copy()
+                    rotation_command = target_rotation.copy()
 
-                pose_command[:3, :3] = (
-                    rotation_command
-                )
+                    phase = "SETTLING"
 
-                pose_command[:3, 3] = (
-                    position_command
-                )
+                    if not settling_warning_printed:
+                        print(
+                            "⚠ [MOTION] Durata nominale "
+                            "superata. Il robot sta completando "
+                            "l'assestamento verso il target."
+                        )
 
-                last_command_pose = (
-                    pose_command.copy()
-                )
+                        settling_warning_printed = True
 
-                # ----------------------------------------------------
-                # Calcolo degli errori
-                # ----------------------------------------------------
+                pose_command = np.eye(4, dtype=float)
+                pose_command[:3, :3] = rotation_command
+                pose_command[:3, 3] = position_command
+
+                last_command_pose = pose_command.copy()
+
+                # --------------------------------------------------------
+                # Errori finali misurati
+                # --------------------------------------------------------
 
                 position_error = float(
                     np.linalg.norm(
-                        target_position
-                        - robot_position
+                        target_position - robot_position
                     )
                 )
 
                 quaternion_dot = abs(
-                    float(
-                        np.dot(
-                            robot_quat,
-                            target_quat,
-                        )
+                    float(np.dot(robot_quat, target_quat))
+                )
+
+                quaternion_dot = float(
+                    np.clip(
+                        quaternion_dot,
+                        0.0,
+                        1.0,
                     )
                 )
 
                 orientation_error = float(
-                    2.0
-                    * np.arccos(
-                        np.clip(
-                            quaternion_dot,
-                            -1.0,
-                            1.0,
-                        )
+                    2.0 * np.arccos(quaternion_dot)
+                )
+
+                last_position_error = position_error
+                last_orientation_error = orientation_error
+
+                # Si termina per successo solo dopo che la traiettoria
+                # nominale è stata completata.
+                target_reached = (
+                    trajectory_complete
+                    and position_error <= tolerance
+                    and orientation_error
+                    <= orientation_tolerance
+                )
+
+                settling_timeout_reached = (
+                    trajectory_complete
+                    and time_elapsed >= maximum_duration
+                    and not target_reached
+                )
+
+                finish_control = (
+                    target_reached
+                    or settling_timeout_reached
+                )
+
+                # --------------------------------------------------------
+                # Errori diagnostici
+                # --------------------------------------------------------
+
+                # O_T_EE_c e O_T_EE_d descrivono il comando elaborato
+                # nel ciclo precedente rispetto a quello che verrà
+                # inviato tra poco.
+                software_to_commanded_error = float(
+                    np.linalg.norm(
+                        position_command
+                        - commanded_robot_position
                     )
                 )
 
-                # ----------------------------------------------------
-                # Invio del comando
-                # ----------------------------------------------------
+                commanded_to_desired_error = float(
+                    np.linalg.norm(
+                        commanded_robot_position
+                        - desired_robot_position
+                    )
+                )
+
+                desired_to_measured_error = float(
+                    np.linalg.norm(
+                        desired_robot_position
+                        - robot_position
+                    )
+                )
+
+                target_to_commanded_error = float(
+                    np.linalg.norm(
+                        target_position
+                        - commanded_robot_position
+                    )
+                )
+
+                target_to_desired_error = float(
+                    np.linalg.norm(
+                        target_position
+                        - desired_robot_position
+                    )
+                )
+
+                # --------------------------------------------------------
+                # Creazione comando pylibfranka
+                # --------------------------------------------------------
 
                 cartesian_command = (
                     _pose_to_cartesian_command(
@@ -993,23 +1123,19 @@ class MotionController:
                 )
 
                 cartesian_command.motion_finished = (
-                    progress >= 1.0
+                    finish_control
                 )
 
-                active_control.writeOnce(
-                    cartesian_command
-                )
-
-                # ----------------------------------------------------
-                # Stampa limitata per il ciclo real-time
-                # ----------------------------------------------------
+                # --------------------------------------------------------
+                # Logging sintetico
+                # --------------------------------------------------------
 
                 if (
                     iteration_count % 100 == 0
-                    or progress >= 1.0
+                    or finish_control
                 ):
                     print(
-                        f"[MOTION] "
+                        f"[MOTION][{phase}] "
                         f"{progress * 100:5.1f}% | "
                         f"errore posizione: "
                         f"{position_error:.6f} m | "
@@ -1018,20 +1144,101 @@ class MotionController:
                         f"({np.rad2deg(orientation_error):.3f}°)"
                     )
 
-                # ----------------------------------------------------
-                # Callback limitata
-                # ----------------------------------------------------
+                # --------------------------------------------------------
+                # Diagnostica dettagliata
+                # --------------------------------------------------------
+
+                if (
+                    iteration_count % 1000 == 0
+                    or finish_control
+                ):
+                    print("[DEBUG CARTESIAN]")
+
+                    print(
+                        "  Target finale:       ",
+                        np.round(
+                            target_position,
+                            6,
+                        ).tolist(),
+                    )
+
+                    print(
+                        "  Comando software:    ",
+                        np.round(
+                            position_command,
+                            6,
+                        ).tolist(),
+                    )
+
+                    print(
+                        "  O_T_EE_c comandata:  ",
+                        np.round(
+                            commanded_robot_position,
+                            6,
+                        ).tolist(),
+                    )
+
+                    print(
+                        "  O_T_EE_d desiderata: ",
+                        np.round(
+                            desired_robot_position,
+                            6,
+                        ).tolist(),
+                    )
+
+                    print(
+                        "  O_T_EE misurata:     ",
+                        np.round(
+                            robot_position,
+                            6,
+                        ).tolist(),
+                    )
+
+                    print(
+                        "  Software → command:  "
+                        f"{software_to_commanded_error:.6f} m"
+                    )
+
+                    print(
+                        "  Command → desired:   "
+                        f"{commanded_to_desired_error:.6f} m"
+                    )
+
+                    print(
+                        "  Desired → measured:  "
+                        f"{desired_to_measured_error:.6f} m"
+                    )
+
+                    print(
+                        "  Target → command:    "
+                        f"{target_to_commanded_error:.6f} m"
+                    )
+
+                    print(
+                        "  Target → desired:    "
+                        f"{target_to_desired_error:.6f} m"
+                    )
+
+                    print(
+                        "  Command success rate:"
+                        f" {control_command_success_rate:.3f}"
+                    )
+
+                # --------------------------------------------------------
+                # Callback
+                # --------------------------------------------------------
 
                 if (
                     progress_callback is not None
                     and (
                         iteration_count % 50 == 0
-                        or progress >= 1.0
+                        or finish_control
                     )
                 ):
                     progress_callback({
                         "type": "cartesian_progress",
                         "iteration": iteration_count,
+                        "phase": phase.lower(),
                         "progress": round(
                             progress * 100.0,
                             2,
@@ -1040,12 +1247,23 @@ class MotionController:
                             time_elapsed,
                             4,
                         ),
-                        "delta_time": round(
-                            dt,
-                            6,
+                        "settling_time": round(
+                            max(
+                                0.0,
+                                time_elapsed
+                                - trajectory_duration,
+                            ),
+                            4,
                         ),
+                        "delta_time": round(dt, 6),
                         "pose_command": (
                             pose_command.tolist()
+                        ),
+                        "pose_commanded_robot": (
+                            commanded_robot_pose.tolist()
+                        ),
+                        "pose_desired_robot": (
+                            desired_robot_pose.tolist()
                         ),
                         "pose_measured": (
                             robot_pose.tolist()
@@ -1066,6 +1284,31 @@ class MotionController:
                             ),
                             4,
                         ),
+                        "software_to_commanded_error": round(
+                            software_to_commanded_error,
+                            6,
+                        ),
+                        "commanded_to_desired_error": round(
+                            commanded_to_desired_error,
+                            6,
+                        ),
+                        "desired_to_measured_error": round(
+                            desired_to_measured_error,
+                            6,
+                        ),
+                        "target_to_commanded_error": round(
+                            target_to_commanded_error,
+                            6,
+                        ),
+                        "target_to_desired_error": round(
+                            target_to_desired_error,
+                            6,
+                        ),
+                        "control_command_success_rate": round(
+                            control_command_success_rate,
+                            4,
+                        ),
+                        "target_reached": target_reached,
                         "contact": (
                             cartesian_contact.tolist()
                         ),
@@ -1074,115 +1317,157 @@ class MotionController:
                         ),
                     })
 
-                if progress >= 1.0:
+                # --------------------------------------------------------
+                # Invio comando
+                # --------------------------------------------------------
+
+                active_control.writeOnce(cartesian_command)
+
+                if finish_control:
                     control_finished = True
+
+                    if settling_timeout_reached:
+                        print(
+                            "⚠ [MOTION] Timeout di "
+                            "assestamento raggiunto: "
+                            f"{settling_timeout:.3f} s oltre "
+                            "la durata nominale."
+                        )
+
                     break
 
-            # --------------------------------------------------------
-            # Verifica della posa finale
-            # --------------------------------------------------------
-
-            final_pose = (
-                self.robot.get_current_cartesian_pose()
-            )
+            # ============================================================
+            # Verifica finale
+            # ============================================================
 
             final_pose = np.asarray(
-                final_pose,
+                self.robot.get_current_cartesian_pose(),
                 dtype=float,
-            ).reshape(
-                (4, 4),
-            )
+            ).reshape((4, 4))
 
-            final_position = (
-                final_pose[:3, 3]
-            )
+            final_position = final_pose[:3, 3].copy()
+            final_rotation = final_pose[:3, :3].copy()
 
-            final_rotation = (
-                final_pose[:3, :3]
-            )
-
-            final_quat = (
-                _rotation_matrix_to_quaternion(
-                    final_rotation
-                )
+            final_quat = _rotation_matrix_to_quaternion(
+                final_rotation
             )
 
             final_position_error = float(
                 np.linalg.norm(
-                    target_position
-                    - final_position
+                    target_position - final_position
                 )
             )
 
             final_quaternion_dot = abs(
-                float(
-                    np.dot(
-                        final_quat,
-                        target_quat,
-                    )
+                float(np.dot(final_quat, target_quat))
+            )
+
+            final_quaternion_dot = float(
+                np.clip(
+                    final_quaternion_dot,
+                    0.0,
+                    1.0,
                 )
             )
 
             final_orientation_error = float(
                 2.0
                 * np.arccos(
-                    np.clip(
-                        final_quaternion_dot,
-                        -1.0,
-                        1.0,
-                    )
+                    final_quaternion_dot
                 )
             )
 
             print(
                 "[MOTION] Posizione finale:",
-                np.round(
-                    final_position,
-                    4,
-                ).tolist(),
+                np.round(final_position, 6).tolist(),
             )
 
             print(
-                "[MOTION] Errore finale posizione: "
+                f"[MOTION] Errore finale posizione: "
                 f"{final_position_error:.6f} m"
             )
 
             print(
-                "[MOTION] Errore finale orientamento: "
+                f"[MOTION] Errore finale orientamento: "
                 f"{final_orientation_error:.6f} rad "
                 f"({np.rad2deg(final_orientation_error):.3f}°)"
             )
 
-            if final_position_error > tolerance:
-                raise RuntimeError(
-                    "Tolleranza di posizione non rispettata: "
-                    f"errore={final_position_error:.6f} m, "
-                    f"tolleranza={tolerance:.6f} m."
-                )
+            position_ok = (
+                final_position_error <= tolerance
+            )
 
-            if (
+            orientation_ok = (
                 final_orientation_error
-                > orientation_tolerance
-            ):
-                raise RuntimeError(
-                    "Tolleranza di orientamento "
-                    "non rispettata: "
-                    f"errore="
-                    f"{final_orientation_error:.6f} rad, "
-                    f"tolleranza="
-                    f"{orientation_tolerance:.6f} rad."
+                <= orientation_tolerance
+            )
+
+            success = position_ok and orientation_ok
+
+            # Il controllo è terminato regolarmente, quindi il wrapper
+            # torna nello stato READY anche se il target non è stato
+            # raggiunto entro il timeout.
+            self.robot.mode = self.robot.mode.__class__.READY
+
+            if not success:
+                print(
+                    "⚠ [MOTION] Movimento terminato senza "
+                    "raggiungere completamente le tolleranze. "
+                    "Il robot NON viene posto in ERROR_LOCKED."
                 )
 
-            self.robot.mode = (
-                self.robot.mode.__class__.READY
+                if not position_ok:
+                    print(
+                        "⚠ [MOTION] Errore posizione: "
+                        f"{final_position_error:.6f} m, "
+                        f"tolleranza: {tolerance:.6f} m."
+                    )
+
+                if not orientation_ok:
+                    print(
+                        "⚠ [MOTION] Errore orientamento: "
+                        f"{final_orientation_error:.6f} rad, "
+                        f"tolleranza: "
+                        f"{orientation_tolerance:.6f} rad."
+                    )
+
+                return False
+
+            settling_time = max(
+                0.0,
+                time_elapsed - trajectory_duration,
             )
 
-            print(
-                "✓ Movimento cartesiano completato "
-                "con successo."
-            )
+            if settling_time > 0.0:
+                print(
+                    "✓ Movimento cartesiano completato dopo "
+                    f"{settling_time:.3f} s di assestamento."
+                )
+            else:
+                print(
+                    "✓ Movimento cartesiano completato "
+                    "con successo."
+                )
 
             return True
+
+        # ================================================================
+        # Input non validi: nessun ERROR_LOCKED
+        # ================================================================
+
+        except ValueError as exc:
+            self.robot.mode = self.robot.mode.__class__.READY
+
+            print(
+                "⚠ [MOTION] Parametri cartesiani non validi: "
+                f"{exc}"
+            )
+
+            return False
+
+        # ================================================================
+        # Errori libfranka: ERROR_LOCKED
+        # ================================================================
 
         except pylibfranka.ControlException as exc:
             error = self.robot._enter_error_locked(
@@ -1195,62 +1480,100 @@ class MotionController:
             )
 
             print(
-                "✗ ControlException durante il "
-                f"movimento cartesiano: {error.message}"
-            )
-
-            traceback.print_exc()
-            return False
-
-        except RuntimeError as exc:
-            error = self.robot._enter_error_locked(
-                operation=(
-                    "motion/move_to_cartesian_pose "
-                    "(RuntimeError)"
-                ),
-                exception=exc,
-                recoverable=False,
-            )
-
-            print(
-                "✗ Movimento cartesiano interrotto: "
-                f"{error.message}"
-            )
-
-            traceback.print_exc()
-            return False
-
-        except Exception as exc:
-            error = self.robot._enter_error_locked(
-                operation=(
-                    "motion/move_to_cartesian_pose "
-                    "(Exception)"
-                ),
-                exception=exc,
-                recoverable=True,
-            )
-
-            print(
-                "✗ Errore durante il movimento "
+                "✗ ControlException durante il movimento "
                 f"cartesiano: {error.message}"
             )
 
             traceback.print_exc()
             return False
 
+        # ================================================================
+        # RuntimeError
+        # ================================================================
+
+        except RuntimeError as exc:
+            if collision_detected:
+                error = self.robot._enter_error_locked(
+                    operation=(
+                        "motion/move_to_cartesian_pose "
+                        "(collision)"
+                    ),
+                    exception=exc,
+                    recoverable=False,
+                )
+
+                print(
+                    "✗ Movimento interrotto per collisione: "
+                    f"{error.message}"
+                )
+
+                traceback.print_exc()
+                return False
+
+            # Il contatto ferma il movimento, ma non imposta
+            # automaticamente ERROR_LOCKED.
+            if contact_detected:
+                self.robot.mode = (
+                    self.robot.mode.__class__.READY
+                )
+
+                print(
+                    "⚠ [MOTION] Movimento interrotto per "
+                    f"contatto: {exc}"
+                )
+
+                return False
+
+            # Una RuntimeError software non blocca automaticamente
+            # il robot.
+            self.robot.mode = self.robot.mode.__class__.READY
+
+            print(
+                "⚠ [MOTION] Movimento terminato con warning: "
+                f"{exc}"
+            )
+
+            traceback.print_exc()
+            return False
+
+        # ================================================================
+        # Errore imprevisto
+        # ================================================================
+
+        except Exception as exc:
+            error = self.robot._enter_error_locked(
+                operation=(
+                    "motion/move_to_cartesian_pose "
+                    "(unexpected exception)"
+                ),
+                exception=exc,
+                recoverable=True,
+            )
+
+            print(
+                "✗ Errore imprevisto durante il movimento "
+                f"cartesiano: {error.message}"
+            )
+
+            traceback.print_exc()
+            return False
+
+        # ================================================================
+        # Cleanup
+        # ================================================================
+
         finally:
-            # Se motion_finished=True è già stato inviato,
-            # non viene scritto un secondo comando.
             if (
                 active_control is not None
                 and not control_finished
             ):
                 try:
                     self.robot.robot.stop()
+
                 except Exception as cleanup_exc:
                     print(
-                        "[MOTION] Arresto fallito: "
-                        f"{cleanup_exc}"
+                        "[MOTION] Arresto del controllo "
+                        f"fallito: {cleanup_exc}"
                     )
     def move_cartesian_relative(
         self,
@@ -1785,6 +2108,7 @@ class MotionController:
 
             active_control = self.robot.robot.start_joint_velocity_control(
                 pylibfranka.ControllerMode.CartesianImpedance
+                #pylibfranka.ControllerMode.JointImpedance
             )
 
             time_elapsed = 0.0
@@ -1862,7 +2186,8 @@ class MotionController:
     ) -> bool:
         self.robot._ensure_can_command()
 
-        home_position = [0, 0, 0, -3.03005749, 1.55690476, 1.56836934, -0.29296873]
+        home_position = [0.059821926057338715,-0.7743019461631775, -0.023823734372854233,-2.373579978942871,
+                         -0.037449367344379425, 1.5682077407836914, 0.8321403861045837]
         print("Ritorno alla posizione home...")
 
         return self.move_to_joint_positions(
