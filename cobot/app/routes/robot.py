@@ -5,6 +5,8 @@ Tutti gli endpoint di movimento sono asincroni: ritornano 202 Accepted
 immediatamente e streamano la telemetria via WebSocket (event: motion_progress).
 """
 
+import math
+
 from flask import Blueprint, request, jsonify
 from app.robot_manager import RobotManager
 from franka_controller import FrankaRobot
@@ -714,6 +716,10 @@ def execute_trajectory():
             tolerance:
               type: number
               example: 0.04
+            segment_duration:
+              type: number
+              description: Optional minimum-jerk duration in seconds for each waypoint (overrides the legacy 5 / speed_factor duration).
+              example: 2.0
     responses:
       202:
         description: Motion accepted.
@@ -741,15 +747,24 @@ def execute_trajectory():
                 {"error": "ogni waypoint deve avere esattamente 7 valori"}
             ), 400
 
-    speed_factor = float(body.get("speed_factor", 0.2))
-    tolerance = float(body.get("tolerance", 0.04))
-    waypoints = [[float(v) for v in wp] for wp in waypoints]
+    try:
+        speed_factor = float(body.get("speed_factor", 0.2))
+        tolerance = float(body.get("tolerance", 0.04))
+        segment_duration = body.get("segment_duration")
+        if segment_duration is not None:
+            segment_duration = float(segment_duration)
+            if not math.isfinite(segment_duration) or segment_duration <= 0.0:
+                raise ValueError("segment_duration deve essere un numero finito positivo")
+        waypoints = [[float(v) for v in wp] for wp in waypoints]
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": f"Parametri traiettoria non validi: {exc}"}), 400
 
     started = manager.run_async(
         manager.robot.motion.execute_trajectory,
         waypoints,
         speed_factor=speed_factor,
         tolerance=tolerance,
+        segment_duration=segment_duration,
     )
     if not started:
         return _busy()
@@ -758,6 +773,7 @@ def execute_trajectory():
             "status": "accepted",
             "operation": "execute_trajectory",
             "num_waypoints": len(waypoints),
+            "segment_duration": segment_duration,
         }
     ), 202
 

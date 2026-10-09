@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Debug Flask Cobot Server",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "app.server",
+      "python": "${workspaceFolder}/venv/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopOnEntry": false,
+      "env": {
+        "FLASK_ENV": "development",
+        "HOST": "127.0.0.1",
+        "PORT": "5000",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  ]
+}

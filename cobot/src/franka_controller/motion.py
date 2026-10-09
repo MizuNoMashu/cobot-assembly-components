@@ -234,6 +234,7 @@ class MotionController:
         speed_factor: float = 0.2,
         tolerance: float = 0.04,
         progress_callback: Optional[Callable[[dict], None]] = None,
+        duration_override: Optional[float] = None,
     ) -> bool:
         """Muove i sette giunti verso una configurazione target."""
 
@@ -251,6 +252,10 @@ class MotionController:
 
             if tolerance <= 0.0:
                 raise ValueError("tolerance deve essere positiva.")
+            if duration_override is not None and (
+                not np.isfinite(duration_override) or duration_override <= 0.0
+            ):
+                raise ValueError("duration_override deve essere un numero finito positivo.")
 
             target = np.asarray(target_positions, dtype=float)
 
@@ -274,7 +279,7 @@ class MotionController:
                 )
             )
 
-            duration = 5.0 / speed_factor
+            duration = duration_override or (5.0 / speed_factor)
             time_elapsed = 0.0
             iteration = 0
 
@@ -552,6 +557,7 @@ class MotionController:
         speed_factor: float = 0.2,
         tolerance: float = 0.04,
         progress_callback: Optional[Callable[[dict], None]] = None,
+        segment_duration: Optional[float] = None,
     ) -> bool:
         """
         Esegue in sequenza una lista di waypoint articolari (7 valori ciascuno),
@@ -565,8 +571,21 @@ class MotionController:
         """
         for waypoint in waypoints:
             self._validate_joint_vector(waypoint, "waypoint")
+        self._validate_speed_factor(speed_factor)
+        if tolerance <= 0.0:
+            raise ValueError("tolerance deve essere positiva.")
 
-        print(f"[TRAJECTORY] Esecuzione di {len(waypoints)} waypoint")
+        if segment_duration is not None and (
+            not np.isfinite(segment_duration) or segment_duration <= 0.0
+        ):
+            raise ValueError("segment_duration deve essere un numero finito positivo.")
+
+        duration_note = (
+            f", {segment_duration:.3f} s per waypoint"
+            if segment_duration is not None
+            else f", durata legacy {5.0 / speed_factor:.3f} s per waypoint"
+        )
+        print(f"[TRAJECTORY] Esecuzione di {len(waypoints)} waypoint{duration_note}")
 
         for index, waypoint in enumerate(waypoints):
             print(
@@ -577,6 +596,7 @@ class MotionController:
                 waypoint,
                 speed_factor=speed_factor,
                 tolerance=tolerance,
+                duration_override=segment_duration,
                 progress_callback=progress_callback,
             )
             if not success:
@@ -2186,8 +2206,8 @@ class MotionController:
     ) -> bool:
         self.robot._ensure_can_command()
 
-        home_position = [0.05305690,-0.78463426, -0.02658343,-2.36318544,
-                         -0.02298530, 1.58207946, 0.82401775]
+        home_position = [0.059821926057338715,-0.7743019461631775, -0.023823734372854233,-2.373579978942871,
+                         -0.037449367344379425, 1.5682077407836914, 0.8321403861045837]
         print("Ritorno alla posizione home...")
 
         return self.move_to_joint_positions(
