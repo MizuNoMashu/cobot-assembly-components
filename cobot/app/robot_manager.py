@@ -8,6 +8,7 @@ la telemetria live via progress_callback.
 
 import inspect
 import traceback
+from datetime import datetime, timezone
 from typing import Optional, Callable, Any
 
 import numpy as np
@@ -40,6 +41,8 @@ class RobotManager:
 
         self.robot: Optional[FrankaRobot] = None
         self._operation_lock = threading.Lock()
+        self._current_operation: Optional[str] = None
+        self._last_operation: dict = {}
         self._cached_state: dict = {}
         self._socketio = None
 
@@ -63,10 +66,15 @@ class RobotManager:
         return self._operation_lock.locked()
 
     def status_dict(self) -> dict:
+        busy = self.is_busy
+        progress = self._cached_state.get("progress") if busy else None
         return {
             "connected": self.is_connected,
-            "busy": self.is_busy,
+            "busy": busy,
             "mode": self.robot.mode.value if self.is_connected else "disconnected",
+            "current_operation": self._current_operation if busy else None,
+            "progress": progress,
+            "last_operation": dict(self._last_operation) if self._last_operation else None,
         }
 
     # ------------------------------------------------------------------
@@ -105,6 +113,13 @@ class RobotManager:
         if not self._operation_lock.acquire(blocking=False):
             return False
 
+        operation_name = func.__name__
+        if operation_name == "_workflow":
+            operation_name = "pick_and_place"
+        elif operation_name == "execute_trajectory" and args:
+            operation_name = f"execute_trajectory ({len(args[0])} waypoint)"
+        self._current_operation = operation_name
+
         signature = inspect.signature(func)
         injected_kwargs = dict(kwargs)
         if "progress_callback" in signature.parameters or any(
@@ -119,13 +134,26 @@ class RobotManager:
                     f"kwargs={list(injected_kwargs.keys())}"
                 )
                 result = func(*args, **injected_kwargs)
+                self._last_operation = {
+                    "operation": operation_name,
+                    "success": bool(result),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "error": None if result else "Operazione terminata con esito negativo.",
+                }
                 self._emit(on_complete_event, {"success": bool(result)})
             except Exception as exc:
                 error_info = traceback.format_exc()
                 print(f"[RobotManager] Async task failed: {exc!r}\n{error_info}")
+                self._last_operation = {
+                    "operation": operation_name,
+                    "success": False,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "error": str(exc),
+                }
                 self._emit("motion_error", {"error": str(exc), "traceback": error_info})
             finally:
                 self._cached_state = {}
+                self._current_operation = None
                 self._operation_lock.release()
 
         thread = threading.Thread(target=_run, daemon=True)
