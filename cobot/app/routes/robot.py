@@ -679,7 +679,7 @@ def move_relative_joints():
     return jsonify({"status": "accepted", "operation": "move_relative"}), 202
 
 
-@robot_bp.route("/motion-position-control/execute-trajectory", methods=["POST"])
+@robot_bp.route("/motion/execute-trajectory", methods=["POST"])
 def execute_trajectory():
     """Execute a multi-waypoint joint trajectory.
 

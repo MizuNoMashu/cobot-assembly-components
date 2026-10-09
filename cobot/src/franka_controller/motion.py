@@ -2186,8 +2186,8 @@ class MotionController:
     ) -> bool:
         self.robot._ensure_can_command()
 
-        home_position = [0.059821926057338715,-0.7743019461631775, -0.023823734372854233,-2.373579978942871,
-                         -0.037449367344379425, 1.5682077407836914, 0.8321403861045837]
+        home_position = [0.05305690,-0.78463426, -0.02658343,-2.36318544,
+                         -0.02298530, 1.58207946, 0.82401775]
         print("Ritorno alla posizione home...")
 
         return self.move_to_joint_positions(

@@ -7,11 +7,17 @@ la telemetria live via progress_callback.
 """
 
 import inspect
-import threading
 import traceback
 from typing import Optional, Callable, Any
 
 import numpy as np
+
+try:
+    from eventlet.patcher import original as original_module
+
+    threading = original_module("threading")
+except ImportError:
+    import threading
 
 from franka_controller import FrankaRobot
 
