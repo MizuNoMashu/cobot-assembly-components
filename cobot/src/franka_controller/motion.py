@@ -378,6 +378,10 @@ class MotionController:
                         or progress >= 1.0
                     )
                 ):
+                    tcp_position = np.asarray(
+                        robot_state.O_T_EE,
+                        dtype=float,
+                    ).reshape((4, 4), order="F")[:3, 3]
                     progress_callback({
                         "type": "motion_progress",
                         "iteration": iteration,
@@ -402,6 +406,11 @@ class MotionController:
                             np.round(q_command, 6)
                             .tolist()
                         ),
+                        "tcp_position": {
+                            "x": float(tcp_position[0]),
+                            "y": float(tcp_position[1]),
+                            "z": float(tcp_position[2]),
+                        },
                         "contact": (
                             cartesian_contact.tolist()
                         ),
@@ -1288,6 +1297,11 @@ class MotionController:
                         "pose_measured": (
                             robot_pose.tolist()
                         ),
+                        "tcp_position": {
+                            "x": float(robot_position[0]),
+                            "y": float(robot_position[1]),
+                            "z": float(robot_position[2]),
+                        },
                         "position_error": round(
                             position_error,
                             6,
