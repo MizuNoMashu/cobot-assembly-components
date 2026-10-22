@@ -4,10 +4,27 @@ Controller per il movimento del robot Franka usando pylibfranka.
 
 import traceback
 import numpy as np
-from typing import List, Optional, Callable, Tuple
+from typing import Any, List, Optional, Callable, Sequence, Tuple
 
 import pylibfranka
 from .utils import compute_minimum_jerk_trajectory
+from .fly_path import plan_fly_trajectory
+from .force_control import (
+    ForceTaskController,
+    ForceTaskFailed,
+    ForceTaskParams,
+    RegraspConfig,
+    as_jacobian,
+    make_params,
+    precheck_screw_passes,
+    precheck_wrist_range,
+    wrist_rewind_target,
+)
+from .trajectory_validation import (
+    ValidationLimits,
+    validate_sampled_trajectory,
+    validate_stop_and_go,
+)
 
 
 
@@ -205,6 +222,7 @@ def _pose_to_cartesian_command(pose: np.ndarray) -> pylibfranka.CartesianPose:
 class MotionController:
     def __init__(self, franka_robot):
         self.robot = franka_robot
+        self.last_force_result: Optional[dict] = None
 
     # ------------------------------------------------------------
     # Internal utilities
@@ -567,6 +585,8 @@ class MotionController:
         tolerance: float = 0.04,
         progress_callback: Optional[Callable[[dict], None]] = None,
         segment_duration: Optional[float] = None,
+        precheck: bool = True,
+        precheck_limits: Optional[ValidationLimits] = None,
     ) -> bool:
         """
         Esegue in sequenza una lista di waypoint articolari (7 valori ciascuno),
@@ -577,6 +597,12 @@ class MotionController:
         minimum-jerk. Si interrompe al primo segmento fallito senza tentare i
         successivi. Si assume che l'ordine dei 7 valori corrisponda all'ordine
         articolare usato altrove in questo modulo (fr3_joint1..7).
+
+        Con precheck=True (default), prima di muovere il robot l'intera
+        traiettoria viene validata (limiti di giunto, velocità/accelerazioni,
+        vicinanza a singolarità lungo il percorso). Se la validazione fallisce
+        o supera il suo budget di tempo viene sollevata
+        TrajectoryValidationError e il robot non si muove.
         """
         for waypoint in waypoints:
             self._validate_joint_vector(waypoint, "waypoint")
@@ -588,6 +614,23 @@ class MotionController:
             not np.isfinite(segment_duration) or segment_duration <= 0.0
         ):
             raise ValueError("segment_duration deve essere un numero finito positivo.")
+
+        if precheck:
+            self.robot._ensure_can_command()
+            q_now = np.asarray(self.robot.get_state().q_d, dtype=float)
+            duration_each = segment_duration or (5.0 / speed_factor)
+            report = validate_stop_and_go(
+                q_now,
+                waypoints,
+                [duration_each] * len(waypoints),
+                precheck_limits,
+            )
+            print(
+                f"[TRAJECTORY] Pre-check OK in {report['elapsed_ms']} ms | "
+                f"sigma_min={report['min_sigma']:.4f} | "
+                f"vel max={report['max_velocity_ratio'] * 100:.0f}% | "
+                f"acc max={report['max_acceleration_ratio'] * 100:.0f}%"
+            )
 
         duration_note = (
             f", {segment_duration:.3f} s per waypoint"
@@ -617,6 +660,226 @@ class MotionController:
 
         print("[TRAJECTORY] ✓ Traiettoria completata")
         return True
+
+    # ------------------------------------------------------------
+    # Fly motion (fly-by / continuous path): nessuno stop nei punti intermedi
+    # ------------------------------------------------------------
+
+    def execute_trajectory_fly(
+        self,
+        waypoints: List[List[float]],
+        speed_factor: float = 0.2,
+        tolerance: float = 0.04,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+        segment_duration: Optional[float] = None,
+        blend_radius: float = 0.15,
+        precheck: bool = True,
+        precheck_limits: Optional[ValidationLimits] = None,
+    ) -> bool:
+        """
+        Esegue i waypoint articolari come un unico percorso continuo (fly-by):
+        il robot non si ferma nei punti intermedi ma li "vola" curvando entro
+        una zona di raccordo di raggio `blend_radius` (rad, spazio dei giunti).
+        Si ferma solo al punto finale (e dove il percorso si inverte quasi del
+        tutto, perché lì non si può volare).
+
+        A differenza di execute_trajectory (un movimento fermo→fermo per
+        waypoint) usa UNA sola sessione di controllo in posizione e una legge
+        temporale a velocità continua: rampa di accelerazione smooth, velocità
+        di crociera, rampa di decelerazione.
+
+        Tempi:
+          - con segment_duration la durata totale richiesta è
+            len(waypoints) * segment_duration (stessa durata complessiva del
+            punto-punto, ma senza soste). Se i limiti di velocità/accelerazione
+            dei giunti o la curvatura dei raccordi non la permettono, la durata
+            viene ALLUNGATA, mai accorciata;
+          - senza segment_duration speed_factor è la frazione del limite di
+            velocità dei giunti usata come velocità di crociera.
+
+        Con precheck=True (default) il percorso raccordato effettivo, campionato
+        nel tempo, viene validato prima di muovere il robot (limiti di giunto,
+        velocità, singolarità) e viene sollevata TrajectoryValidationError se
+        non è sicuro o se il pre-check supera il suo budget di tempo.
+        """
+        if not waypoints:
+            raise ValueError("waypoints non può essere vuoto.")
+        for waypoint in waypoints:
+            self._validate_joint_vector(waypoint, "waypoint")
+        self._validate_speed_factor(speed_factor)
+        if tolerance <= 0.0:
+            raise ValueError("tolerance deve essere positiva.")
+        if not np.isfinite(blend_radius) or blend_radius < 0.0:
+            raise ValueError("blend_radius deve essere un numero finito >= 0.")
+        if segment_duration is not None and (
+            not np.isfinite(segment_duration) or segment_duration <= 0.0
+        ):
+            raise ValueError("segment_duration deve essere un numero finito positivo.")
+
+        self.robot._ensure_can_command()
+
+        limits = precheck_limits or ValidationLimits.from_env()
+        q_start = np.asarray(self.robot.get_state().q_d, dtype=float)
+        requested_duration = (
+            segment_duration * len(waypoints) if segment_duration is not None else None
+        )
+
+        trajectory = plan_fly_trajectory(
+            q_start,
+            waypoints,
+            blend_radius=blend_radius,
+            speed_factor=speed_factor,
+            requested_duration=requested_duration,
+            limits=limits,
+        )
+        if not trajectory.parts:
+            print("[FLY] Il robot è già nella posizione richiesta: nessun movimento.")
+            return True
+
+        summary = trajectory.summary()
+        total_duration = trajectory.duration
+        print(
+            f"[FLY] Percorso: {len(waypoints)} waypoint, raccordo {blend_radius:.3f} rad, "
+            f"durata {total_duration:.2f} s"
+            + (f" (richiesta {requested_duration:.2f} s)" if requested_duration else "")
+            + f", {summary['num_parts']} tratto/i, limite: {summary['limited_by']}"
+        )
+
+        if precheck:
+            times, samples = trajectory.sample(dt=0.02)
+            report = validate_sampled_trajectory(times, samples, limits)
+            print(
+                f"[FLY] Pre-check OK in {report['elapsed_ms']} ms | "
+                f"sigma_min={report['min_sigma']:.4f} | "
+                f"vel max={report['max_velocity_ratio'] * 100:.0f}%"
+            )
+
+        target = trajectory.end_point
+        active_control = None
+        control_finished = False
+
+        try:
+            self.robot.mode = self.robot.mode.__class__.RUNNING
+            active_control = self.robot.robot.start_joint_position_control(
+                pylibfranka.ControllerMode.JointImpedance
+            )
+
+            time_elapsed = 0.0
+            iteration = 0
+
+            while True:
+                robot_state, period = active_control.readOnce()
+                dt = period.to_sec()
+                time_elapsed += dt
+                iteration += 1
+
+                q_measured = np.asarray(robot_state.q, dtype=float)
+                cartesian_contact = np.asarray(robot_state.cartesian_contact, dtype=bool)
+                cartesian_collision = np.asarray(robot_state.cartesian_collision, dtype=bool)
+
+                if np.any(cartesian_contact) or np.any(cartesian_collision):
+                    stop_command = pylibfranka.JointPositions(q_measured.tolist())
+                    stop_command.motion_finished = True
+                    active_control.writeOnce(stop_command)
+                    control_finished = True
+                    if np.any(cartesian_collision):
+                        raise RuntimeError("Collisione cartesiana rilevata.")
+                    raise RuntimeError("Contatto cartesiano rilevato.")
+
+                finished = time_elapsed >= total_duration
+                q_command = trajectory.q_at(min(time_elapsed, total_duration))
+
+                command = pylibfranka.JointPositions(q_command.tolist())
+                command.motion_finished = finished
+                active_control.writeOnce(command)
+
+                progress = min(time_elapsed / total_duration, 1.0)
+
+                if iteration % 100 == 0:
+                    max_error = float(np.max(np.abs(q_command - q_measured)))
+                    print(
+                        f"[FLY] {progress * 100:5.1f}% | "
+                        f"errore max comando-misura: {max_error:.5f} rad"
+                    )
+
+                if progress_callback is not None and (iteration % 50 == 0 or finished):
+                    tcp_position = np.asarray(
+                        robot_state.O_T_EE, dtype=float
+                    ).reshape((4, 4), order="F")[:3, 3]
+                    progress_callback({
+                        "type": "motion_progress",
+                        "mode": "fly",
+                        "iteration": iteration,
+                        "progress": round(progress * 100.0, 2),
+                        "time_elapsed": round(time_elapsed, 4),
+                        "delta_time": round(dt, 6),
+                        "q_measured": np.round(q_measured, 6).tolist(),
+                        "dq_measured": np.round(
+                            np.asarray(robot_state.dq, dtype=float), 6
+                        ).tolist(),
+                        "q_command": np.round(q_command, 6).tolist(),
+                        "tcp_position": {
+                            "x": float(tcp_position[0]),
+                            "y": float(tcp_position[1]),
+                            "z": float(tcp_position[2]),
+                        },
+                        "contact": cartesian_contact.tolist(),
+                        "collision": cartesian_collision.tolist(),
+                    })
+
+                if finished:
+                    control_finished = True
+                    break
+
+            q_final = np.asarray(self.robot.get_state().q, dtype=float)
+            final_error = float(np.max(np.abs(target - q_final)))
+            print(f"[FLY] Errore massimo finale: {final_error:.6f} rad")
+            if final_error > tolerance:
+                raise RuntimeError(
+                    "Tolleranza non rispettata: "
+                    f"errore={final_error:.6f} rad, tolleranza={tolerance:.6f} rad."
+                )
+
+            self.robot.mode = self.robot.mode.__class__.READY
+            print("✓ Fly motion completata")
+            return True
+
+        except pylibfranka.ControlException as exc:
+            error = self.robot._enter_error_locked(
+                operation="motion/execute_trajectory_fly (ControlException)",
+                exception=exc,
+                recoverable=False,
+            )
+            print(f"✗ ControlException durante la fly motion: {error.message}")
+            traceback.print_exc()
+            return False
+
+        except RuntimeError as exc:
+            error = self.robot._enter_error_locked(
+                operation="motion/execute_trajectory_fly (RuntimeError)",
+                exception=exc,
+                recoverable=False,
+            )
+            print(f"✗ Fly motion interrotta: {error.message}")
+            traceback.print_exc()
+            return False
+
+        except Exception as exc:
+            error = self.robot._enter_error_locked(
+                operation="motion/execute_trajectory_fly (Exception)",
+                exception=exc,
+                recoverable=True,
+            )
+            print(f"✗ Errore durante la fly motion: {error.message}")
+            traceback.print_exc()
+            return False
+
+        finally:
+            if active_control is not None and not control_finished:
+                try:
+                    self.robot.robot.stop()
+                except Exception as cleanup_exc:
+                    print(f"[FLY] Arresto fallito: {cleanup_exc}")
 
     # ------------------------------------------------------------
     # Cartesian placeholder
@@ -2081,6 +2344,314 @@ class MotionController:
                         "[IMPEDANCE] Arresto fallito: "
                         f"{cleanup_exc}"
                     )
+
+    # ------------------------------------------------------------
+    # Force control: spinta con forza controllata, inserimento, avvitamento
+    # ------------------------------------------------------------
+
+    def apply_force(
+        self,
+        force: float,
+        duration: float = 5.0,
+        axis: Sequence[float] = (0.0, 0.0, 1.0),
+        progress_callback: Optional[Callable[[dict], None]] = None,
+        **tuning: Any,
+    ) -> bool:
+        """Spinge lungo `axis` (frame del tool, default z) con `force` N per `duration` s."""
+        params = make_params("hold", force, hold_time=duration, axis_tool=tuple(axis), **tuning)
+        return self.run_force_task(params, progress_callback)
+
+    def insert_with_force(
+        self,
+        force: float,
+        target_depth: float,
+        axis: Sequence[float] = (0.0, 0.0, 1.0),
+        progress_callback: Optional[Callable[[dict], None]] = None,
+        **tuning: Any,
+    ) -> bool:
+        """Inserisce spingendo con `force` N lungo `axis` fino a `target_depth` m dal contatto."""
+        params = make_params(
+            "insert", force, target_depth=target_depth, axis_tool=tuple(axis), **tuning
+        )
+        return self.run_force_task(params, progress_callback)
+
+    def screw(
+        self,
+        angle: float,
+        force: float = 10.0,
+        axis: Sequence[float] = (0.0, 0.0, 1.0),
+        progress_callback: Optional[Callable[[dict], None]] = None,
+        **tuning: Any,
+    ) -> bool:
+        """
+        Avvita: spinge con `force` N lungo `axis` e ruota di `angle` rad attorno ad esso.
+
+        La rotazione è quella del giunto 7 (escursione ~±3 rad): per più giri
+        serve riprendere la vite (regrasp). La coppia è limitata a `max_torque`.
+        """
+        params = make_params("screw", force, angle=angle, axis_tool=tuple(axis), **tuning)
+        return self.run_force_task(params, progress_callback)
+
+    def run_force_task(
+        self,
+        params: ForceTaskParams,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+    ) -> bool:
+        """
+        Esegue un task di forza (hold / insert / screw) in torque control.
+
+        Ritorna True se l'obiettivo è raggiunto. Se non lo è (nessun contatto,
+        blocco, timeout, coppia massima…) il controllo termina in ordine, con
+        la forza riportata a zero senza bloccare il robot, e viene sollevata
+        ForceTaskFailed con il motivo. Una forza oltre il limite di sicurezza o
+        una collisione fermano subito il controllo (ERROR_LOCKED).
+
+        Durante il task le soglie di collisione di libfranka vengono alzate
+        (quelle di default, 10 N, scatterebbero appena si spinge) e al termine
+        ripristinate ai valori di default di FrankaRobot.set_collision_behavior().
+        """
+        self.robot._ensure_can_command()
+
+        initial_state = self.robot.get_state()
+        q0 = np.asarray(initial_state.q, dtype=float)
+        T0 = np.asarray(initial_state.O_T_EE, dtype=float).reshape((4, 4), order="F")
+        precheck_wrist_range(params, q0)
+
+        controller = ForceTaskController(params, q0, T0[:3, 3], T0[:3, :3])
+        model = self.robot.robot.load_model()
+
+        print(
+            f"[FORCE] {params.mode}: {params.force:.1f} N lungo asse tool "
+            f"{np.round(params.axis_unit, 3).tolist()}"
+            + (f", profondità {params.target_depth * 1000:.1f} mm" if params.target_depth else "")
+            + (f", rotazione {params.angle:.2f} rad" if params.mode == "screw" else "")
+            + f" | limite di sicurezza {params.abort_force:.0f} N"
+        )
+
+        active_control = None
+        control_finished = False
+        thresholds_set = False
+
+        try:
+            self.robot.set_collision_behavior(**params.collision_thresholds())
+            thresholds_set = True
+
+            self.robot.mode = self.robot.mode.__class__.RUNNING
+            active_control = self.robot.robot.start_torque_control()
+
+            time_elapsed = 0.0
+            iteration = 0
+
+            while True:
+                robot_state, period = active_control.readOnce()
+                dt = period.to_sec()
+                time_elapsed += dt
+                iteration += 1
+
+                if np.any(np.asarray(robot_state.cartesian_collision, dtype=bool)):
+                    raise RuntimeError("Collisione cartesiana rilevata: torque control interrotto.")
+
+                q = np.asarray(robot_state.q, dtype=float)
+                dq = np.asarray(robot_state.dq, dtype=float)
+                pose = np.asarray(robot_state.O_T_EE, dtype=float).reshape((4, 4), order="F")
+                out = controller.step(
+                    t=time_elapsed,
+                    dt=dt,
+                    q=q,
+                    dq=dq,
+                    x=pose[:3, 3],
+                    R=pose[:3, :3],
+                    J=as_jacobian(model.zero_jacobian(robot_state)),
+                    coriolis=np.asarray(model.coriolis(robot_state), dtype=float),
+                    ext_wrench=np.asarray(robot_state.O_F_ext_hat_K, dtype=float),
+                    tau_prev=np.asarray(robot_state.tau_J_d, dtype=float),
+                )
+
+                command = pylibfranka.Torques(out.tau.tolist())
+                command.motion_finished = out.finished
+                active_control.writeOnce(command)
+
+                if iteration % 100 == 0:
+                    print(
+                        f"[FORCE] {out.info['phase']:8s} F={out.info['force_measured']:6.2f} N "
+                        f"(des {out.info['force_desired']:5.2f}) | profondità "
+                        f"{out.info['depth_m'] * 1000:6.2f} mm | angolo {out.info['angle_rad']:6.3f} rad"
+                    )
+
+                if progress_callback is not None and (iteration % 50 == 0 or out.finished):
+                    progress_callback({
+                        "type": "force_progress",
+                        "mode": params.mode,
+                        "iteration": iteration,
+                        "time_elapsed": round(time_elapsed, 4),
+                        "delta_time": round(dt, 6),
+                        "q_measured": np.round(q, 6).tolist(),
+                        "tcp_position": {
+                            "x": float(pose[0, 3]),
+                            "y": float(pose[1, 3]),
+                            "z": float(pose[2, 3]),
+                        },
+                        **out.info,
+                    })
+
+                if out.finished:
+                    control_finished = True
+                    break
+
+            result = controller.result()
+            self.last_force_result = result
+            self.robot.mode = self.robot.mode.__class__.READY
+            if not result["success"]:
+                raise ForceTaskFailed(result["reason"], result)
+
+            print(f"✓ Force task completato: {result['reason']} | {result}")
+            return True
+
+        except ForceTaskFailed as exc:
+            self.robot.mode = self.robot.mode.__class__.READY
+            print(f"⚠ [FORCE] Obiettivo non raggiunto: {exc} | {exc.result}")
+            raise
+
+        except pylibfranka.ControlException as exc:
+            error = self.robot._enter_error_locked(
+                operation="motion/run_force_task (ControlException)",
+                exception=exc,
+                recoverable=False,
+            )
+            print(f"✗ ControlException durante il force task: {error.message}")
+            traceback.print_exc()
+            return False
+
+        except RuntimeError as exc:
+            error = self.robot._enter_error_locked(
+                operation="motion/run_force_task (RuntimeError)",
+                exception=exc,
+                recoverable=False,
+            )
+            print(f"✗ Force task interrotto: {error.message}")
+            traceback.print_exc()
+            return False
+
+        except Exception as exc:
+            error = self.robot._enter_error_locked(
+                operation="motion/run_force_task (Exception)",
+                exception=exc,
+                recoverable=True,
+            )
+            print(f"✗ Errore durante il force task: {error.message}")
+            traceback.print_exc()
+            return False
+
+        finally:
+            if active_control is not None and not control_finished:
+                try:
+                    self.robot.robot.stop()
+                except Exception as cleanup_exc:
+                    print(f"[FORCE] Arresto fallito: {cleanup_exc}")
+            if thresholds_set:
+                try:
+                    self.robot.set_collision_behavior()
+                except Exception as cleanup_exc:
+                    print(f"[FORCE] Ripristino soglie di collisione fallito: {cleanup_exc}")
+
+    def run_screw_passes(
+        self,
+        params: ForceTaskParams,
+        regrasp: RegraspConfig,
+        iterations: int = 1,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+    ) -> bool:
+        """
+        Avvitamento a più passate come UNICA operazione.
+
+        Ripete `iterations` volte la passata di avvitamento descritta da
+        `params` (angolo per passata, forza, coppia…). Tra una passata e la
+        successiva esegue la ripresa configurata in `regrasp`: il giunto 7
+        viene riportato a vuoto all'estremo opposto dell'escursione, così ogni
+        passata ha a disposizione tutta la rotazione. Si ferma prima se una
+        passata raggiunge la coppia di serraggio (stop_at_torque): la vite è
+        a battuta e le passate restanti non servono.
+
+        Il pre-check (escursione del giunto 7, parametri di ripresa) avviene
+        prima di muovere il robot. Un fallimento in una passata o nella
+        ripresa solleva ForceTaskFailed indicando il numero di passata.
+        """
+        self.robot._ensure_can_command()
+        precheck_screw_passes(
+            params, regrasp, iterations, np.asarray(self.robot.get_state().q, dtype=float)
+        )
+
+        total_angle = 0.0
+        for index in range(iterations):
+            label = f"passata {index + 1}/{iterations}"
+            print(f"[SCREW] {label}: {params.angle:.2f} rad con {params.force:.1f} N")
+
+            def pass_callback(data: dict, _index: int = index) -> None:
+                if progress_callback is not None:
+                    progress_callback({**data, "pass": _index + 1, "passes": iterations})
+
+            try:
+                self.run_force_task(params, pass_callback)
+            except ForceTaskFailed as exc:
+                raise ForceTaskFailed(f"{label}: {exc}", exc.result) from exc
+            if self.robot.mode.value == "error_locked":
+                return False
+            result = self.last_force_result or {}
+            total_angle += float(result.get("angle_rad", 0.0))
+
+            if result.get("torque_reached"):
+                print(f"[SCREW] {label}: coppia di serraggio raggiunta, passate restanti saltate.")
+                break
+            if index < iterations - 1:
+                self._regrasp(params, regrasp, label, progress_callback)
+
+        print(f"✓ Avvitamento completato: rotazione totale ~{total_angle:.2f} rad")
+        return True
+
+    def _regrasp(
+        self,
+        params: ForceTaskParams,
+        regrasp: RegraspConfig,
+        label: str,
+        progress_callback: Optional[Callable[[dict], None]],
+    ) -> None:
+        def fail(step: str) -> None:
+            raise ForceTaskFailed(f"{label}: ripresa fallita ({step})")
+
+        print(f"[SCREW] {label}: ripresa ({regrasp.mode})")
+        gripper = self.robot.gripper if regrasp.mode == "gripper" else None
+
+        if gripper is not None and not gripper.open(
+            width=regrasp.open_width_mm / 1000.0, speed=regrasp.gripper_speed
+        ):
+            fail("apertura del gripper")
+
+        if regrasp.mode == "retract":
+            axis = params.axis_unit * -regrasp.retract_distance
+            if not self.move_cartesian_relative(
+                float(axis[0]), float(axis[1]), float(axis[2]), speed_factor=0.1,
+                progress_callback=progress_callback,
+            ):
+                fail("arretramento lungo l'asse")
+
+        q = np.asarray(self.robot.get_state().q, dtype=float)
+        target = q.copy()
+        target[6] = wrist_rewind_target(params)
+        distance = abs(target[6] - q[6])
+        if distance > 1e-3:
+            duration = max(1.0, 1.875 * distance / regrasp.rewind_speed)
+            if not self.move_to_joint_positions(
+                target.tolist(), speed_factor=0.2, tolerance=0.04,
+                progress_callback=progress_callback, duration_override=duration,
+            ):
+                fail("riavvolgimento del giunto 7")
+
+        if gripper is not None and not gripper.grasp(
+            width=regrasp.grasp_width_mm / 1000.0,
+            force=regrasp.grasp_force,
+            speed=regrasp.gripper_speed,
+        ):
+            fail("presa della vite")
 
     #------------------------------------------------------------
     # Move joint positions with stiffness wrapper

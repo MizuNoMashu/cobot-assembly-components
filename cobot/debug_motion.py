@@ -81,6 +81,7 @@ try:
         ("move_joints", lambda r: r.motion.move_to_joint_positions((r.get_current_joint_positions() + [0.05,0,0,0,0,0,0]).tolist(), speed_factor=0.5)),
         ("move_relative", lambda r: r.motion.move_relative([0.02,0,0,0,0,0,0], speed_factor=0.5)),
         ("execute_trajectory", lambda r: r.motion.execute_trajectory([r.get_current_joint_positions().tolist(), (r.get_current_joint_positions()+[0.03,0,-0.03,0,0,0,0]).tolist(), r.get_current_joint_positions().tolist()], speed_factor=0.4)),
+        ("execute_trajectory_fly", lambda r: r.motion.execute_trajectory_fly([(r.get_current_joint_positions()+[0.03,0,-0.03,0,0,0,0]).tolist(), (r.get_current_joint_positions()+[0.03,0.03,-0.03,0,0,0,0]).tolist(), r.get_current_joint_positions().tolist()], speed_factor=0.4, blend_radius=0.02)),
         ("move_cartesian_relative", lambda r: r.motion.move_cartesian_relative(dz=0.03, speed_factor=0.4)),
         ("impedance_control", lambda r: r.motion.impedance_control((r.get_current_joint_positions()+[0.02,0,0,0,0,0,0]).tolist(), duration=3.0)),
     ]

@@ -369,11 +369,15 @@ Le route di movimento rispondono normalmente con **`202 Accepted`**: il comando 
 | Posizione home | `POST /api/motion/move-home` |
 | Target di 7 giunti | `POST /api/motion-position-control/move` |
 | Spostamento relativo dei giunti | `POST /api/motion-position-control/move-relative` |
-| Sequenza di waypoint articolari | `POST /api/motion/execute-trajectory` |
+| Sequenza di waypoint articolari, con arresto a ogni waypoint | `POST /api/motion/execute-trajectory` |
+| Sequenza di waypoint articolari in Fly Motion (senza arresti intermedi) | `POST /api/motion/execute-trajectory-fly` |
 | Posa cartesiana assoluta (x, y, z, roll, pitch, yaw) | `POST /api/motion-cartesian/move` |
 | Spostamento cartesiano relativo | `POST /api/motion-cartesian/move-relative` |
 | Controllo articolare con impedenza | `POST /api/motion-position-control/move-impedance` e `POST /api/motion-joint-control/move` |
 | Workflow pick-and-place | `POST /api/motion/pick-and-place` |
+| Spinta con forza controllata | `POST /api/motion-force/apply` |
+| Inserimento con forza fino a una profondità | `POST /api/motion-force/insert` |
+| Avvitamento (forza assiale + rotazione con coppia limitata) | `POST /api/motion-force/screw` |
 
 I target articolari sono vettori di 7 valori (radianti). Le pose cartesiane usano metri per posizione e radianti per roll/pitch/yaw. Il controller applica validazioni, profilo di interpolazione minimum-jerk e controlli di contatto/collisione secondo il metodo usato. Una traiettoria esterna, ad esempio pianificata da MoveIt, può essere inviata come lista di waypoint; l'esecuzione dei waypoint resta a carico di questo servizio.
 
@@ -404,6 +408,18 @@ I vettori `q` riportati qui sotto sono configurazioni dei sette giunti, in radia
 3. Pianificare separatamente approccio-pick, pick-retract, trasferimento al place e uscita. Verificare collisioni e traiettorie in RViz/simulazione; non interpolare linearmente waypoint articolari ignorando gli ostacoli.
 4. Provare prima a velocità ridotta e in uno spazio libero, con arresto di emergenza disponibile. L'approccio e la rettrazione devono mantenere il pezzo e l'ambiente liberi da collisioni.
 5. MoveIt pianifica; il servizio cobot esegue. Se si inviano traiettorie all'endpoint `POST /api/motion/execute-trajectory`, il payload deve contenere waypoint articolari di 7 valori in radianti, nello stesso ordine joint usato dal controller. La route esegue i waypoint in sequenza tramite movimenti verso target: non importa direttamente un messaggio `JointTrajectory` completo né i tempi/velocità per punto.
+
+   **Controllo pre-esecuzione.** Prima di muovere il robot, `execute-trajectory` e `execute-trajectory-fly` validano la traiettoria (`franka_controller/trajectory_validation.py`): limiti di giunto con margine, velocità/accelerazioni di picco rispetto ai limiti FR3, e vicinanza a singolarità (`sigma_min` del Jacobiano, calcolato con la cinematica FR3 in `kinematics.py`) lungo il percorso campionato, non solo sui waypoint. Se fallisce, il robot non si muove e l'errore compare in `last_operation.error` (evento WebSocket `motion_error`). Il controllo ha un budget di tempo: se scade, la traiettoria è rifiutata (fail-safe). Il controllo gira nel thread di movimento, quindi la risposta `202` resta immediata e include `precheck_timeout_sec`, da sommare ai timeout di attesa lato client.
+
+   | Variabile d'ambiente | Default | Significato |
+   | --- | --- | --- |
+   | `COBOT_PRECHECK_TIMEOUT_SEC` | `10` | budget di tempo del pre-check |
+   | `COBOT_PRECHECK_MIN_SIGMA` | `0.02` | soglia minima di `sigma_min(J)`; sotto = singolarità |
+   | `COBOT_PRECHECK_VELOCITY_FRACTION` | `0.8` | frazione massima del limite di velocità di giunto |
+   | `COBOT_PRECHECK_ACCEL_FRACTION` | `0.8` | frazione massima del limite di accelerazione di giunto (10 rad/s², da verificare sul proprio FR3) |
+   | `COBOT_PRECHECK_JOINT_MARGIN` | `0.02` | margine in rad dai limiti di posizione |
+
+   **Fly Motion** (`POST /api/motion/execute-trajectory-fly`): stessi waypoint, ma eseguiti come un unico percorso continuo. I punti intermedi sono via-point: attorno a ciascuno il percorso curva entro una zona di raccordo di raggio `blend_radius` (rad, spazio dei giunti, default `0.15`, limitato al 50% dei segmenti adiacenti) e il robot si ferma solo al punto finale. Le inversioni di direzione quasi complete non si possono "volare": lì il robot si ferma. Con `segment_duration` la durata richiesta è `len(waypoints) * segment_duration`; se i limiti di velocità/accelerazione o la curvatura dei raccordi non la permettono, la durata viene **allungata**, mai accorciata. Provare prima a bassa velocità: le soglie sono un punto di partenza da tarare sul robot reale.
 6. Coordinare l'apertura/chiusura del gripper con le fasi pick/release e attendere il completamento di ogni fase prima di inviare quella successiva.
 
 Esempio della forma dei dati per il planner cartesiano (i campi tra parentesi angolari vanno sostituiti con FK reali; non inviare questo esempio come comando):
@@ -446,3 +462,34 @@ Per testare senza robot reale, non inviare comandi di movimento a un indirizzo d
 - Il container usa `network_mode: host`; è una scelta per la connettività FCI e va considerata nell'isolamento di rete.
 - Prima di esporre il servizio fuori da una rete fidata, configurare autenticazione/autorizzazione API, segreti, TLS e policy CORS restrittive. Il server attuale usa CORS `*` per Socket.IO e una chiave Flask predefinita: non sono impostazioni sufficienti per un deployment pubblico.
 - Un `200` da `/health` indica che il processo risponde, non che robot, Desk API, token o FCI siano pronti. Verificare gli stati specifici prima di comandare il braccio.
+
+## Force control: inserire e avvitare
+
+pylibfranka non ha una modalità "force control": per applicare una forza si usa il torque control (`start_torque_control`) comandando `tau = Jᵀ · wrench + Coriolis` (la gravità è compensata dal robot) e si legge la forza di contatto da `O_F_ext_hat_K`. La logica è in `franka_controller/force_control.py` (pura, testabile senza robot) ed è eseguita da `MotionController.run_force_task`.
+
+**Controllo ibrido** lungo l'asse del tool (default z, la direzione di avvicinamento): forza controllata (feed-forward + PI sulla forza misurata); nelle altre direzioni impedenza cartesiana (`lateral_stiffness`, più è bassa più l'inserimento si autoallinea); orientamento in impedenza.
+
+**Fasi:** azzeramento dell'offset della stima di forza → avvicinamento a velocità limitata fino al contatto (`contact_threshold`) → rampa smooth della forza → mantenimento/inserimento/avvitamento → rilascio smooth della forza. La derivata della coppia comandata è limitata (`max_torque_step`).
+
+| Task | Cosa fa | Obiettivo | Fallimento (senza bloccare il robot) |
+| --- | --- | --- | --- |
+| `apply` | spinge con `force` N | tempo `duration` | nessun contatto entro `max_approach_distance` |
+| `insert` | spinge con `force` N | `target_depth` m dal contatto | blocco (nessun avanzamento per `stall_time`), `max_time`, `max_depth` |
+| `screw` | spinge con `force` N e, a forza stabilizzata, ruota di `angle` rad attorno all'asse | rotazione completata, oppure coppia `max_torque` con `stop_at_torque` | coppia massima senza `stop_at_torque`, blocco, limite di giunto |
+
+Se l'obiettivo non è raggiunto la forza viene riportata a zero in modo ordinato, il robot resta `READY` e l'errore compare in `last_operation.error` (evento `motion_error`). Una forza oltre `abort_force` (default `max(2F, F+15)` N, mai oltre 80 N) o una collisione ferma subito il controllo (`ERROR_LOCKED`, vedi recovery).
+
+**Soglie di collisione.** Il default di `set_collision_behavior` è 10 N: spingendo con più di ~10 N scatterebbe il reflex. Durante il task le soglie vengono alzate (`abort_force + 10`) e poi ripristinate ai default.
+
+**Quale usare per avvitare?** Inserire con una forza (`insert`) per cose che entrano a pressione o con un piccolo gioco; `screw` per viti/tappi filettati: la forza assiale tiene la punta in presa mentre la rotazione fa avanzare il filetto da solo (la forza lascia libero l'asse, quindi il passo non va specificato). La rotazione è quella del **giunto 7** (escursione ~±3 rad): una singola passata arriva a circa ±5 rad dalla posizione corrente e viene rifiutata in anticipo (400) se non ci sta. Per più giri si usa `iterations` (1–20): l'operazione resta unica ma ripete la passata (`angle` è **per passata**) e tra una passata e l'altra riporta a vuoto il giunto 7 all'estremo opposto dell'escursione. La ripresa si sceglie con `regrasp_mode`:
+
+| `regrasp_mode` | Sequenza tra le passate | Parametri |
+| --- | --- | --- |
+| `gripper` | apre il gripper → riavvolge il giunto 7 → richiude sulla vite | `grasp_width_mm` (obbligatorio), `open_width_mm`, `grasp_force`, `gripper_speed` |
+| `retract` | arretra lungo l'asse → riavvolge il giunto 7; la passata dopo si riavvicina fino al contatto (cacciavite/bit) | `retract_distance` (m), richiede `approach_speed > 0` |
+| `none` | solo riavvolgimento (utensile a cricchetto) | – |
+
+`rewind_speed` (rad/s) regola il riavvolgimento. Con `stop_at_torque` una passata che raggiunge la coppia di serraggio ferma le passate restanti. I parametri (escursione del giunto 7 per la prima passata e per le successive, parametri di ripresa) sono validati prima di muovere il robot (400); un errore in una passata o nella ripresa indica il numero di passata (`passata 2/3: …`). Il primo passaggio parte dalla posizione corrente del giunto 7: se non ci sta, va posizionato prima (le passate successive ripartono dall'estremo opposto). Esempio: `{"force": 10, "angle": 5.0, "iterations": 3, "regrasp_mode": "gripper", "grasp_width_mm": 8, "open_width_mm": 20}`.
+
+**Da tarare sul robot reale** (non provato su hardware, solo simulato): guadagni (`kp_force`, `ki_force`, `lateral_stiffness`, `rotational_stiffness`), soglie di collisione dei giunti (`collision_thresholds()`), il formato di `Model.zero_jacobian` (gestito sia come 42 valori column-major sia come array 6×7). Iniziare con forze basse (3–5 N), `approach_speed` 0.005 m/s e l'arresto di emergenza a portata di mano.
+

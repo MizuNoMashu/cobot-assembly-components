@@ -10,6 +10,12 @@ import math
 from flask import Blueprint, request, jsonify
 from app.robot_manager import RobotManager
 from franka_controller import FrankaRobot
+from franka_controller.force_control import (
+    make_params,
+    make_regrasp,
+    precheck_screw_passes,
+)
+from franka_controller.trajectory_validation import ValidationLimits
 
 robot_bp = Blueprint("robot", __name__, url_prefix="/api")
 manager = RobotManager()
@@ -23,6 +29,40 @@ def _busy():
 
 def _not_connected():
     return jsonify({"error": "robot non connesso"}), 503
+
+
+def _parse_trajectory_body(body):
+    """Valida il body comune alle route di esecuzione traiettoria.
+
+    Ritorna ((waypoints, speed_factor, tolerance, segment_duration), None)
+    oppure (None, risposta_di_errore_400).
+    """
+    waypoints = body.get("waypoints")
+    if not waypoints or not isinstance(waypoints, list):
+        return None, (
+            jsonify({"error": "waypoints deve essere una lista non vuota di liste di 7 float"}),
+            400,
+        )
+    for wp in waypoints:
+        if not isinstance(wp, list) or len(wp) != 7:
+            return None, (
+                jsonify({"error": "ogni waypoint deve avere esattamente 7 valori"}),
+                400,
+            )
+
+    try:
+        speed_factor = float(body.get("speed_factor", 0.2))
+        tolerance = float(body.get("tolerance", 0.04))
+        segment_duration = body.get("segment_duration")
+        if segment_duration is not None:
+            segment_duration = float(segment_duration)
+            if not math.isfinite(segment_duration) or segment_duration <= 0.0:
+                raise ValueError("segment_duration deve essere un numero finito positivo")
+        waypoints = [[float(v) for v in wp] for wp in waypoints]
+    except (TypeError, ValueError) as exc:
+        return None, (jsonify({"error": f"Parametri traiettoria non validi: {exc}"}), 400)
+
+    return (waypoints, speed_factor, tolerance, segment_duration), None
 
 
 # ------------------------------------------------------------------
@@ -692,6 +732,13 @@ def execute_trajectory():
     minimum-jerk di /motion/move-joints), nell'ordine ricevuto. Si assume che
     i 7 valori di ogni waypoint siano nello stesso ordine articolare usato da
     /motion/move-joints e /motion/move-relative (fr3_joint1..7).
+
+    Prima di muovere il robot l'intera traiettoria passa un controllo
+    pre-esecuzione (limiti di giunto, velocità/accelerazioni, singolarità);
+    se fallisce il robot non si muove e l'errore è in last_operation.error
+    (evento WebSocket motion_error). Il controllo gira nel thread di movimento,
+    quindi la risposta 202 resta immediata. Per la versione senza soste nei
+    punti intermedi vedi /motion/execute-trajectory-fly.
     ---
     tags:
       - Motion
@@ -735,29 +782,10 @@ def execute_trajectory():
     if manager.is_busy:
         return _busy()
 
-    body = request.get_json(silent=True) or {}
-    waypoints = body.get("waypoints")
-    if not waypoints or not isinstance(waypoints, list):
-        return jsonify(
-            {"error": "waypoints deve essere una lista non vuota di liste di 7 float"}
-        ), 400
-    for wp in waypoints:
-        if not isinstance(wp, list) or len(wp) != 7:
-            return jsonify(
-                {"error": "ogni waypoint deve avere esattamente 7 valori"}
-            ), 400
-
-    try:
-        speed_factor = float(body.get("speed_factor", 0.2))
-        tolerance = float(body.get("tolerance", 0.04))
-        segment_duration = body.get("segment_duration")
-        if segment_duration is not None:
-            segment_duration = float(segment_duration)
-            if not math.isfinite(segment_duration) or segment_duration <= 0.0:
-                raise ValueError("segment_duration deve essere un numero finito positivo")
-        waypoints = [[float(v) for v in wp] for wp in waypoints]
-    except (TypeError, ValueError) as exc:
-        return jsonify({"error": f"Parametri traiettoria non validi: {exc}"}), 400
+    parsed, error = _parse_trajectory_body(request.get_json(silent=True) or {})
+    if error is not None:
+        return error
+    waypoints, speed_factor, tolerance, segment_duration = parsed
 
     started = manager.run_async(
         manager.robot.motion.execute_trajectory,
@@ -774,8 +802,359 @@ def execute_trajectory():
             "operation": "execute_trajectory",
             "num_waypoints": len(waypoints),
             "segment_duration": segment_duration,
+            "precheck_timeout_sec": ValidationLimits.from_env().timeout_sec,
         }
     ), 202
+
+
+@robot_bp.route("/motion/execute-trajectory-fly", methods=["POST"])
+def execute_trajectory_fly():
+    """Execute a joint trajectory as a fly motion (no stop at intermediate points).
+
+    Stessi waypoint di /motion/execute-trajectory, ma eseguiti come un unico
+    percorso continuo (fly-by / continuous path): i punti intermedi non sono
+    destinazioni ma via-point, e attorno a ciascuno il percorso curva entro una
+    zona di raccordo di raggio `blend_radius` (rad, spazio dei giunti). Il robot
+    si ferma solo al punto finale. Prima di muovere il robot il percorso
+    raccordato viene validato (limiti di giunto, velocità, singolarità).
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            waypoints:
+              type: array
+              items:
+                type: array
+                items:
+                  type: number
+                minItems: 7
+                maxItems: 7
+            speed_factor:
+              type: number
+              description: Frazione del limite di velocità dei giunti (usata se segment_duration è assente).
+              example: 0.2
+            tolerance:
+              type: number
+              example: 0.04
+            segment_duration:
+              type: number
+              description: Durata totale richiesta = len(waypoints) * segment_duration. Può essere allungata se i limiti di velocità/accelerazione lo richiedono.
+              example: 0.7
+            blend_radius:
+              type: number
+              description: Raggio delle zone di raccordo in rad (0 = nessun raccordo).
+              example: 0.15
+    responses:
+      202:
+        description: Motion accepted (il pre-check gira nel thread di movimento; un eventuale rifiuto appare in last_operation.error / evento motion_error).
+      400:
+        description: Invalid waypoints or parameters.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
+    if not manager.is_connected:
+        return _not_connected()
+    if manager.is_busy:
+        return _busy()
+
+    body = request.get_json(silent=True) or {}
+    parsed, error = _parse_trajectory_body(body)
+    if error is not None:
+        return error
+    waypoints, speed_factor, tolerance, segment_duration = parsed
+
+    try:
+        blend_radius = float(body.get("blend_radius", 0.15))
+        if not math.isfinite(blend_radius) or blend_radius < 0.0:
+            raise ValueError("blend_radius deve essere un numero finito >= 0")
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": f"Parametri traiettoria non validi: {exc}"}), 400
+
+    started = manager.run_async(
+        manager.robot.motion.execute_trajectory_fly,
+        waypoints,
+        speed_factor=speed_factor,
+        tolerance=tolerance,
+        segment_duration=segment_duration,
+        blend_radius=blend_radius,
+    )
+    if not started:
+        return _busy()
+    return jsonify(
+        {
+            "status": "accepted",
+            "operation": "execute_trajectory_fly",
+            "num_waypoints": len(waypoints),
+            "segment_duration": segment_duration,
+            "blend_radius": blend_radius,
+            "precheck_timeout_sec": ValidationLimits.from_env().timeout_sec,
+        }
+    ), 202
+
+
+_REGRASP_KEYS = {
+    "regrasp_mode", "rewind_speed", "retract_distance",
+    "open_width_mm", "grasp_width_mm", "grasp_force", "gripper_speed",
+}
+
+
+def _force_task_response(mode, body, required, aliases=None, passes=False):
+    """Valida il body di una route di force control e avvia il task.
+
+    I parametri sono validati in modo sincrono (400 se non validi, anche il
+    limite del giunto 7 per l'avvitamento); il task gira poi in background
+    come le altre route di movimento. Con passes=True accetta `iterations` e
+    i parametri di ripresa e avvia un avvitamento a più passate.
+    """
+    if not manager.is_connected:
+        return _not_connected()
+    if manager.is_busy:
+        return _busy()
+
+    fields = dict(body)
+    for name, target in (aliases or {}).items():
+        if name in fields:
+            fields[target] = fields.pop(name)
+    try:
+        for name in required:
+            if fields.get(name) is None:
+                raise ValueError(f"{name} è obbligatorio")
+        force = fields.pop("force")
+        if "axis_tool" in fields:
+            fields["axis_tool"] = tuple(float(v) for v in fields["axis_tool"])
+        regrasp_fields = {}
+        iterations = 1
+        if passes:
+            regrasp_fields = {k: fields.pop(k) for k in list(fields) if k in _REGRASP_KEYS}
+            raw_iterations = fields.pop("iterations", 1)
+            if isinstance(raw_iterations, bool) or int(raw_iterations) != raw_iterations:
+                raise ValueError("iterations deve essere un intero")
+            iterations = int(raw_iterations)
+        params = make_params(mode, force, **fields)
+        # con una sola passata non serve nessuna ripresa: i relativi parametri sono ignorati
+        regrasp = (
+            make_regrasp(**regrasp_fields) if passes and iterations > 1
+            else make_regrasp(regrasp_mode="none") if passes else None
+        )
+        if passes:
+            # il limite del giunto 7 dipende dalla posizione corrente: errore subito
+            precheck_screw_passes(params, regrasp, iterations, manager.robot.get_state().q)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": f"Parametri di forza non validi: {exc}"}), 400
+
+    if passes:
+        started = manager.run_async(
+            manager.robot.motion.run_screw_passes, params, regrasp, iterations
+        )
+    else:
+        started = manager.run_async(manager.robot.motion.run_force_task, params)
+    if not started:
+        return _busy()
+    response = {
+        "status": "accepted",
+        "operation": f"force_{mode}",
+        "force": params.force,
+        "abort_force": params.abort_force,
+        "axis_tool": list(params.axis_tool),
+    }
+    if passes:
+        response["iterations"] = iterations
+        response["regrasp_mode"] = regrasp.mode
+    return jsonify(response), 202
+
+
+@robot_bp.route("/motion-force/apply", methods=["POST"])
+def force_apply():
+    """Press with a controlled force.
+
+    Spinge lungo un asse del tool (default z) con una forza costante, dopo un
+    avvicinamento a velocità limitata fino al contatto. Torque control con
+    forza lungo l'asse e impedenza nelle altre direzioni.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [force]
+          properties:
+            force:
+              type: number
+              description: Forza di spinta in N (max 40).
+              example: 10
+            duration:
+              type: number
+              description: Tempo di mantenimento della forza in s.
+              example: 5
+            axis_tool:
+              type: array
+              items:
+                type: number
+              description: Asse di spinta nel frame del tool (default [0,0,1]).
+            approach_speed:
+              type: number
+              description: Velocità di avvicinamento in m/s (0 = già a contatto, default 0.01).
+            max_approach_distance:
+              type: number
+              description: Corsa massima senza contatto in m (default 0.05).
+    responses:
+      202:
+        description: Task accepted (l'esito finale è in last_operation).
+      400:
+        description: Invalid parameters.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
+    return _force_task_response(
+        "hold", request.get_json(silent=True) or {}, ["force"], {"duration": "hold_time"}
+    )
+
+
+@robot_bp.route("/motion-force/insert", methods=["POST"])
+def force_insert():
+    """Insert by pushing with a controlled force.
+
+    Dopo il contatto spinge con `force` N finché l'oggetto è avanzato di
+    `target_depth` m. Termina con errore (senza bloccare il robot) se
+    l'inserimento si blocca, va in timeout o supera max_depth.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [force, target_depth]
+          properties:
+            force:
+              type: number
+              example: 15
+            target_depth:
+              type: number
+              description: Profondità di inserimento in m dal punto di contatto.
+              example: 0.012
+            max_time:
+              type: number
+              example: 30
+            stall_time:
+              type: number
+              description: Secondi senza avanzamento prima di dichiarare il blocco.
+              example: 1.5
+            lateral_stiffness:
+              type: number
+              description: Cedevolezza laterale in N/m (più bassa = più autoallineante).
+              example: 300
+    responses:
+      202:
+        description: Task accepted.
+      400:
+        description: Invalid parameters.
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
+    return _force_task_response(
+        "insert", request.get_json(silent=True) or {}, ["force", "target_depth"]
+    )
+
+
+@robot_bp.route("/motion-force/screw", methods=["POST"])
+def force_screw():
+    """Screw: push with a controlled force while rotating about the tool axis.
+
+    Spinge con `force` N e, a forza stabilizzata, ruota di `angle` rad attorno
+    all'asse con coppia limitata a `max_torque` Nm. La rotazione è quella del
+    giunto 7 (escursione ~±3 rad): una passata oltre il limite viene rifiutata
+    subito con 400. Con `iterations` > 1 l'operazione resta unica ma ripete la
+    passata più volte; tra una passata e l'altra il giunto 7 viene riportato a
+    vuoto all'estremo opposto con la ripresa scelta in `regrasp_mode`:
+    "gripper" (apre, riavvolge, richiude sulla vite), "retract" (arretra
+    lungo l'asse e riavvolge: cacciavite/bit) o "none" (cricchetto).
+    Con `stop_at_torque` la coppia massima è l'obiettivo (serraggio) e
+    ferma le passate restanti; altrimenti raggiungerla è un errore.
+    ---
+    tags:
+      - Motion
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [force, angle]
+          properties:
+            force:
+              type: number
+              example: 10
+            angle:
+              type: number
+              description: Rotazione PER PASSATA in rad con segno, regola della mano destra attorno all'asse z del tool (se z punta verso la vite, positivo = avvitare una vite destrorsa).
+              example: 5.0
+            iterations:
+              type: integer
+              description: Numero di passate (1-20). Rotazione totale = iterations x angle.
+              example: 2
+            regrasp_mode:
+              type: string
+              enum: [gripper, retract, none]
+              example: gripper
+            grasp_width_mm:
+              type: number
+              description: Larghezza della presa sulla vite in mm (obbligatorio con regrasp_mode gripper).
+              example: 8
+            open_width_mm:
+              type: number
+              example: 20
+            grasp_force:
+              type: number
+              example: 40
+            retract_distance:
+              type: number
+              description: Arretramento in m (regrasp_mode retract).
+              example: 0.005
+            rewind_speed:
+              type: number
+              description: Velocità di riavvolgimento a vuoto del giunto 7 in rad/s.
+              example: 1.0
+            angular_speed:
+              type: number
+              example: 0.3
+            max_torque:
+              type: number
+              description: Coppia massima attorno all'asse in Nm (max 6).
+              example: 2.0
+            stop_at_torque:
+              type: boolean
+              example: false
+    responses:
+      202:
+        description: Task accepted.
+      400:
+        description: Invalid parameters (anche rotazione oltre il limite del giunto 7).
+      503:
+        description: Robot not connected.
+      409:
+        description: Robot is busy.
+    """
+    return _force_task_response(
+        "screw", request.get_json(silent=True) or {}, ["force", "angle"], passes=True
+    )
 
 
 @robot_bp.route("/motion-position-control/move-impedance", methods=["POST"])

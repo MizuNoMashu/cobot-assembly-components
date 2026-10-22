@@ -116,8 +116,12 @@ class RobotManager:
         operation_name = func.__name__
         if operation_name == "_workflow":
             operation_name = "pick_and_place"
-        elif operation_name == "execute_trajectory" and args:
-            operation_name = f"execute_trajectory ({len(args[0])} waypoint)"
+        elif operation_name in ("execute_trajectory", "execute_trajectory_fly") and args:
+            operation_name = f"{operation_name} ({len(args[0])} waypoint)"
+        elif operation_name == "run_force_task" and args:
+            operation_name = f"force_{args[0].mode}"
+        elif operation_name == "run_screw_passes" and len(args) >= 3:
+            operation_name = f"force_screw ({args[2]} passate)"
         self._current_operation = operation_name
 
         signature = inspect.signature(func)
