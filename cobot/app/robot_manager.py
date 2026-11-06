@@ -21,6 +21,7 @@ except ImportError:
     import threading
 
 from franka_controller import FrankaRobot
+from franka_controller.robot import EMERGENCY_STOP_MESSAGE, EmergencyStop
 
 
 class RobotManager:
@@ -72,6 +73,7 @@ class RobotManager:
             "connected": self.is_connected,
             "busy": busy,
             "mode": self.robot.mode.value if self.is_connected else "disconnected",
+            "stop_requested": self.robot.stop_requested if self.is_connected else False,
             "current_operation": self._current_operation if busy else None,
             "progress": progress,
             "last_operation": dict(self._last_operation) if self._last_operation else None,
@@ -112,6 +114,10 @@ class RobotManager:
         """
         if not self._operation_lock.acquire(blocking=False):
             return False
+
+        # uno stop richiesto per l'operazione precedente non deve fermare questa
+        if self.robot is not None:
+            self.robot.clear_stop()
 
         operation_name = func.__name__
         if operation_name == "_workflow":
@@ -156,6 +162,7 @@ class RobotManager:
                 }
                 self._emit("motion_error", {"error": str(exc), "traceback": error_info})
             finally:
+                self._apply_emergency_stop()
                 self._cached_state = {}
                 self._current_operation = None
                 self._operation_lock.release()
@@ -163,6 +170,71 @@ class RobotManager:
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
         return True
+
+    # ------------------------------------------------------------------
+    # Arresto software
+    # ------------------------------------------------------------------
+
+    def request_stop(self) -> dict:
+        """
+        Chiede di fermare subito l'operazione in corso, qualunque sia il tipo.
+
+        Non prende il lock (lo tiene l'operazione da fermare): imposta solo un
+        flag che i loop di controllo leggono a ogni ciclo (1 kHz). Il robot va
+        in ERROR_LOCKED e si sblocca solo con POST /api/robot/recovery.
+        Se non c'è nessuna operazione in corso non fa nulla.
+        """
+        if not self.is_connected:
+            raise RuntimeError("Robot non connesso.")
+
+        operation = self._current_operation
+        if not self.is_busy:
+            return {"stop_requested": False, "operation": None,
+                    "message": "Nessuna operazione in corso."}
+
+        self.robot.request_stop()
+        if not self.is_busy:  # l'operazione è finita proprio ora
+            self.robot.clear_stop()
+            return {"stop_requested": False, "operation": None,
+                    "message": "Nessuna operazione in corso."}
+
+        if operation == "homing":
+            # l'homing è una chiamata bloccante che non legge il flag
+            try:
+                self.robot.gripper.stop()
+            except Exception as exc:
+                print(f"[RobotManager] Stop gripper fallito: {exc}")
+
+        print(f"[RobotManager] ARRESTO richiesto durante: {operation}")
+        return {"stop_requested": True, "operation": operation,
+                "message": "Arresto richiesto: il robot resta in ERROR_LOCKED "
+                           "fino a POST /api/robot/recovery."}
+
+    def _apply_emergency_stop(self) -> None:
+        """
+        A fine operazione: se è stato richiesto lo stop il robot resta bloccato.
+
+        Vale per qualunque tipo di operazione (anche quelle che non leggono il
+        flag, come l'homing, o che sono finite nel frattempo).
+        """
+        robot = self.robot
+        if robot is None or not robot.stop_requested:
+            return
+        if robot.mode.value != "error_locked":
+            robot._enter_error_locked(
+                operation="emergency_stop",
+                exception=EmergencyStop(EMERGENCY_STOP_MESSAGE),
+                recoverable=False,
+            )
+        last = dict(self._last_operation) if self._last_operation else {}
+        last["emergency_stop"] = True
+        if not last.get("success"):
+            last["error"] = EMERGENCY_STOP_MESSAGE
+        self._last_operation = last
+        self._emit("emergency_stop", {
+            "operation": last.get("operation"),
+            "message": EMERGENCY_STOP_MESSAGE,
+        })
 
     # ------------------------------------------------------------------
     # State reading (safe anche durante il movimento)

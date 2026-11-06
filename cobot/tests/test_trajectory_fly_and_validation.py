@@ -150,6 +150,7 @@ class _FakeFranka:
         from franka_controller.robot import RobotMode
 
         self.mode = RobotMode.READY
+        self.stop_requested = False
         self.q = np.array(q0, dtype=float)
         self.log = []
         self.locked = None

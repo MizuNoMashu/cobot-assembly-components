@@ -13,6 +13,22 @@ import datetime
 from enum import Enum
 from typing import Optional, List
 
+# Il flag di stop viene scritto dal thread HTTP (eventlet) e letto dal thread
+# vero del loop di controllo: serve il threading originale, non quello patchato.
+try:
+    from eventlet.patcher import original as _original
+
+    _threading = _original("threading")
+except ImportError:
+    import threading as _threading
+
+EMERGENCY_STOP_MESSAGE = "Arresto di emergenza software richiesto dall'utente."
+
+
+class EmergencyStop(RuntimeError):
+    """Arresto software richiesto dall'utente (POST /api/robot/stop)."""
+
+
 class RobotMode(Enum):
     DISCONNECTED = "disconnected"
     READY = "ready"
@@ -27,6 +43,7 @@ class RobotErrorType(Enum):
     VALIDATION = "validation_error"
     COMMAND = "command_error"
     RECOVERY = "recovery_error"
+    EMERGENCY_STOP = "emergency_stop"
     UNKNOWN = "unknown_error"
 
 
@@ -65,6 +82,8 @@ class FrankaRobot:
         self.mode: RobotMode = RobotMode.DISCONNECTED
         self.errors: List[RobotError] = []
         self.last_error: Optional[RobotError] = None
+
+        self._stop_event = _threading.Event()
 
         self._connect()
 
@@ -124,6 +143,9 @@ class FrankaRobot:
     def _classify_error(self, exception: Exception) ->RobotErrorType:
         msg = str(exception).lower()
         cls_name = exception.__class__.__name__.lower()
+
+        if isinstance(exception, EmergencyStop):
+            return RobotErrorType.EMERGENCY_STOP
 
         if "realtime" in msg or "priority" in msg or "scheduler" in msg:
             return RobotErrorType.REALTIME
@@ -218,6 +240,39 @@ class FrankaRobot:
             )
 
     # ------------------------------------------------------------
+    # Arresto software
+    # ------------------------------------------------------------
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_event.is_set()
+
+    def request_stop(self) -> None:
+        """Chiede ai loop di controllo di fermarsi al prossimo ciclo (non bloccante)."""
+        self._stop_event.set()
+
+    def clear_stop(self) -> None:
+        self._stop_event.clear()
+
+    def check_stop(self) -> None:
+        """
+        Punto di controllo per le sequenze multi-step (fuori dai loop a 1 kHz).
+
+        Se è stato richiesto lo stop porta il robot in ERROR_LOCKED (si sblocca
+        solo con automatic_error_recovery) e solleva EmergencyStop.
+        """
+        if not self._stop_event.is_set():
+            return
+        exc = EmergencyStop(EMERGENCY_STOP_MESSAGE)
+        if self.mode != RobotMode.ERROR_LOCKED:
+            self._enter_error_locked(
+                operation="emergency_stop",
+                exception=exc,
+                recoverable=False,
+            )
+        raise exc
+
+    # ------------------------------------------------------------
     # Read methods
     # ------------------------------------------------------------
 
@@ -276,8 +331,15 @@ class FrankaRobot:
         upper_torque_thresholds: Optional[List[float]] = None,
         lower_force_thresholds: Optional[List[float]] = None,
         upper_force_thresholds: Optional[List[float]] = None,
+        allow_locked: bool = False,
     ) -> None:
-        self._ensure_can_command()
+        # allow_locked: serve al ripristino delle soglie dopo un task di forza
+        # fermato (stop, collisione): il robot è in ERROR_LOCKED ma le soglie
+        # alzate per il task non devono restare attive.
+        if allow_locked:
+            self._ensure_connected()
+        else:
+            self._ensure_can_command()
 
         if lower_torque_thresholds is None:
             lower_torque_thresholds = [10,10,10,10,10,10,10]#[20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0]
@@ -399,6 +461,7 @@ class FrankaRobot:
 
             self.mode =RobotMode.READY
             self.last_error = None
+            self.clear_stop()
 
             print("✓ Recovery automatico completato. Robot nuovamente READY.")
             return True

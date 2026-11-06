@@ -10,6 +10,7 @@ import math
 from flask import Blueprint, request, jsonify
 from app.robot_manager import RobotManager
 from franka_controller import FrankaRobot
+from franka_controller.robot import EmergencyStop
 from franka_controller.force_control import (
     make_params,
     make_regrasp,
@@ -345,6 +346,41 @@ def recovery():
         return _busy()
     success = manager.robot.automatic_error_recovery()
     return jsonify({"success": success, "mode": manager.robot.mode.value}), 200
+
+
+@robot_bp.route("/robot/stop", methods=["POST"])
+def emergency_stop():
+    """Software emergency stop.
+
+    Ferma subito l'operazione in corso, di qualunque tipo (movimenti, forza,
+    impedenza, traiettorie, pick-and-place, homing). Nei loop di controllo il
+    taglio avviene al ciclo successivo (1 kHz). Il robot resta in ERROR_LOCKED
+    fino a POST /api/robot/recovery. Se non c'e' nessuna operazione in corso
+    non fa nulla (200, stop_requested=false).
+
+    NON e' una funzione di sicurezza certificata: dipende dal processo Python
+    e dalla rete. Non sostituisce il pulsante di emergenza fisico.
+    ---
+    tags:
+      - Robot
+    responses:
+      200:
+        description: Stop richiesto (stop_requested=true) oppure nessuna operazione in corso.
+        schema:
+          type: object
+          properties:
+            stop_requested:
+              type: boolean
+            operation:
+              type: string
+            message:
+              type: string
+      503:
+        description: Robot not connected.
+    """
+    if not manager.is_connected:
+        return _not_connected()
+    return jsonify(manager.request_stop()), 200
 
 
 @robot_bp.route("/robot/collision-behavior", methods=["POST"])
@@ -1329,10 +1365,15 @@ def pick_and_place():
         robot = manager.robot
         sio = manager._socketio
 
-        def _step(msg):
+        def _notify(msg):
             print(f"[PICK&PLACE] {msg}")
             if sio:
                 sio.emit("workflow_step", {"message": msg})
+
+        def _step(msg):
+            # dopo uno stop nessun passo successivo (es. apertura gripper) deve partire
+            robot.check_stop()
+            _notify(msg)
 
         try:
             _step("Step 1/7: home position")
@@ -1368,12 +1409,17 @@ def pick_and_place():
                 speed_factor=speed_factor, progress_callback=progress_callback
             )
 
-            _step("✓ Workflow completato")
+            _notify("✓ Workflow completato")
             return True
 
+        except EmergencyStop:
+            _notify("✗ Workflow interrotto: arresto di emergenza software")
+            return False
+
         except Exception as exc:
-            _step(f"✗ Errore durante il workflow: {exc}")
-            robot.automatic_error_recovery()
+            _notify(f"✗ Errore durante il workflow: {exc}")
+            if not robot.stop_requested:
+                robot.automatic_error_recovery()
             return False
 
     started = manager.run_async(_workflow, on_complete_event="workflow_complete")

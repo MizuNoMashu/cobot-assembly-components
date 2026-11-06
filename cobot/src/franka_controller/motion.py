@@ -7,6 +7,7 @@ import numpy as np
 from typing import Any, List, Optional, Callable, Sequence, Tuple
 
 import pylibfranka
+from .robot import EMERGENCY_STOP_MESSAGE, EmergencyStop
 from .utils import compute_minimum_jerk_trajectory
 from .fly_path import plan_fly_trajectory
 from .force_control import (
@@ -325,6 +326,15 @@ class MotionController:
                     robot_state.cartesian_collision,
                     dtype=bool,
                 )
+
+                if self.robot.stop_requested:
+                    stop_command = pylibfranka.JointPositions(
+                        q_measured.tolist()
+                    )
+                    stop_command.motion_finished = True
+                    active_control.writeOnce(stop_command)
+                    control_finished = True
+                    raise EmergencyStop(EMERGENCY_STOP_MESSAGE)
 
                 if (
                     np.any(cartesian_contact)
@@ -777,6 +787,13 @@ class MotionController:
                 cartesian_contact = np.asarray(robot_state.cartesian_contact, dtype=bool)
                 cartesian_collision = np.asarray(robot_state.cartesian_collision, dtype=bool)
 
+                if self.robot.stop_requested:
+                    stop_command = pylibfranka.JointPositions(q_measured.tolist())
+                    stop_command.motion_finished = True
+                    active_control.writeOnce(stop_command)
+                    control_finished = True
+                    raise EmergencyStop(EMERGENCY_STOP_MESSAGE)
+
                 if np.any(cartesian_contact) or np.any(cartesian_collision):
                     stop_command = pylibfranka.JointPositions(q_measured.tolist())
                     stop_command.motion_finished = True
@@ -1210,6 +1227,18 @@ class MotionController:
                     robot_state.cartesian_collision,
                     dtype=bool,
                 )
+
+                if self.robot.stop_requested:
+                    stop_command = _pose_to_cartesian_command(
+                        last_command_pose
+                    )
+
+                    stop_command.motion_finished = True
+
+                    active_control.writeOnce(stop_command)
+                    control_finished = True
+
+                    raise EmergencyStop(EMERGENCY_STOP_MESSAGE)
 
                 if np.any(cartesian_collision):
                     collision_detected = True
@@ -1785,6 +1814,20 @@ class MotionController:
             return False
 
         # ================================================================
+        # Arresto software richiesto dall'utente: ERROR_LOCKED fino al recovery
+        # (senza questo handler una RuntimeError qui riporterebbe a READY)
+        # ================================================================
+
+        except EmergencyStop as exc:
+            error = self.robot._enter_error_locked(
+                operation="motion/move_to_cartesian_pose (emergency stop)",
+                exception=exc,
+                recoverable=False,
+            )
+            print(f"✗ Movimento cartesiano arrestato: {error.message}")
+            return False
+
+        # ================================================================
         # RuntimeError
         # ================================================================
 
@@ -2109,6 +2152,9 @@ class MotionController:
                 # Nel controllo di impedenza un contatto non comporta
                 # necessariamente l'arresto. Una collisione, invece,
                 # interrompe il controllo.
+                if self.robot.stop_requested:
+                    raise EmergencyStop(EMERGENCY_STOP_MESSAGE)
+
                 if np.any(cartesian_collision):
                     raise RuntimeError(
                         "Collisione cartesiana rilevata: "
@@ -2448,6 +2494,8 @@ class MotionController:
                 time_elapsed += dt
                 iteration += 1
 
+                if self.robot.stop_requested:
+                    raise EmergencyStop(EMERGENCY_STOP_MESSAGE)
                 if np.any(np.asarray(robot_state.cartesian_collision, dtype=bool)):
                     raise RuntimeError("Collisione cartesiana rilevata: torque control interrotto.")
 
@@ -2550,7 +2598,7 @@ class MotionController:
                     print(f"[FORCE] Arresto fallito: {cleanup_exc}")
             if thresholds_set:
                 try:
-                    self.robot.set_collision_behavior()
+                    self.robot.set_collision_behavior(allow_locked=True)
                 except Exception as cleanup_exc:
                     print(f"[FORCE] Ripristino soglie di collisione fallito: {cleanup_exc}")
 
@@ -2618,6 +2666,7 @@ class MotionController:
         def fail(step: str) -> None:
             raise ForceTaskFailed(f"{label}: ripresa fallita ({step})")
 
+        self.robot.check_stop()
         print(f"[SCREW] {label}: ripresa ({regrasp.mode})")
         gripper = self.robot.gripper if regrasp.mode == "gripper" else None
 
@@ -2646,6 +2695,7 @@ class MotionController:
             ):
                 fail("riavvolgimento del giunto 7")
 
+        self.robot.check_stop()
         if gripper is not None and not gripper.grasp(
             width=regrasp.grasp_width_mm / 1000.0,
             force=regrasp.grasp_force,
@@ -2724,6 +2774,8 @@ class MotionController:
                 iteration_count += 1
                 robot_state, delta_time = active_control.readOnce()
                 q_last = np.array(robot_state.q)
+                if self.robot.stop_requested:
+                    raise EmergencyStop(EMERGENCY_STOP_MESSAGE)
                 dt = delta_time.to_sec()
                 time_elapsed += dt
 

@@ -214,9 +214,13 @@ class _FakeTorqueRobot:
         self.collision_calls = []
         self.stopped = False
         self.last_tau = np.zeros(7)
+        self.stop_requested = False
 
     # -- FrankaRobot
     def _ensure_can_command(self):
+        pass
+
+    def check_stop(self):
         pass
 
     def get_state(self):
@@ -305,7 +309,7 @@ def test_apply_force_end_to_end_restores_collision_thresholds(force_motion):
     # soglie alzate all'inizio, poi ripristinate ai default (chiamata senza argomenti)
     assert len(fake.collision_calls) == 2
     assert fake.collision_calls[0]["upper_force_thresholds"][0] > 20.0
-    assert fake.collision_calls[1] == {}
+    assert fake.collision_calls[1] == {"allow_locked": True}
 
 
 def test_failed_goal_raises_without_locking_robot(force_motion):
@@ -315,7 +319,7 @@ def test_failed_goal_raises_without_locking_robot(force_motion):
     with pytest.raises(ForceTaskFailed, match="nessun contatto"):
         controller.apply_force(10.0, duration=1.0, max_approach_distance=0.01)
     assert fake.locked is None
-    assert fake.collision_calls[-1] == {}
+    assert fake.collision_calls[-1] == {"allow_locked": True}
 
 
 def test_over_force_locks_robot_and_stops(force_motion):
@@ -357,6 +361,7 @@ def _passes_controller(monkeypatch, results, fail_grasp=False, q7=-2.5):
     fake = type("F", (), {})()
     fake.mode = RobotMode.READY
     fake._ensure_can_command = lambda: None
+    fake.check_stop = lambda: None
     fake.get_state = lambda: type("S", (), {"q": [0, -0.78, 0, -2.36, 0, 1.57, q7]})()
     fake.gripper = _FakeGripper(log, fail_grasp)
     controller = motion_module.MotionController(fake)
